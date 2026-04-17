@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+uploads/*
+outputs/*
+vector_store/*
+!uploads/.gitkeep
+!outputs/.gitkeep
+!vector_store/.gitkeep
