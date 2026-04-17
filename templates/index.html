@@ -10,109 +10,98 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
 </head>
 <body>
-  <div class="shell">
-    <header class="hero">
-      <div class="hero-copy">
-    <p class="eyebrow">第十七届服创大赛 A04 · Flask + DeepSeek + Local RAG</p>
-  <h1>多模态AI互动式教学智能体 Demo（高数助攻版）</h1>
-  <p class="hero-text">基于 A04 赛题“多模态AI互动式教学智能体”的演示实现：当前以高等数学备课为主场景，支持需求澄清、资料解析、知识融合、PPT/教案生成与导出。</p>
+  <div class="app-shell">
+    <aside class="history-sidebar">
+      <div class="sidebar-head">
+        <div class="brand">A04 Teaching Agent</div>
+        <button id="sidebarNewChatBtn" class="btn btn-primary">+ 新对话</button>
       </div>
-      <div class="hero-status">
-        <div class="metric">
-          <span>当前状态</span>
-          <strong id="sessionState">未初始化</strong>
+      <div class="sidebar-section-title">历史会话</div>
+      <div id="sessionHistoryList" class="session-history-list"></div>
+    </aside>
+
+    <main class="main-workspace">
+      <header class="workspace-topbar">
+        <div>
+          <h1>多模态教学智能体</h1>
+          <p class="sub">ChatGPT 风格交互 · 高数备课场景</p>
         </div>
-        <div class="metric-grid">
+        <div class="status-metrics">
+          <article><span>状态</span><strong id="sessionState">未初始化</strong></article>
           <article><span>需求完整度</span><strong id="sessionIdText">0%</strong></article>
-          <article><span>资料切片数</span><strong id="chunkCount">0</strong></article>
-          <article><span>已上传资料</span><strong id="fileCount">0</strong></article>
-          <article><span>当前模式</span><strong id="apiMode">等待 DeepSeek</strong></article>
+          <article><span>资料切片</span><strong id="chunkCount">0</strong></article>
+          <article><span>模式</span><strong id="apiMode">等待 DeepSeek</strong></article>
         </div>
-      </div>
-    </header>
+      </header>
 
-    <main class="layout">
-  <section class="panel equal-panel">
-        <div class="panel-head">
-          <div>
-            <p class="section-tag">01 A04 Demo 对话澄清</p>
-            <h2>高数备课需求采集</h2>
+      <section id="chatView" class="workspace-view active">
+        <div class="chat-layout">
+          <div class="chat-main-card">
+            <div id="slotBoard" class="slot-board"></div>
+            <div class="template-quickbar">
+              <button id="toggleTemplatePickerBtn" class="btn btn-light small" disabled>选择模板</button>
+              <div id="selectedTemplateText" class="meta">尚未选择模板（将自动使用推荐模板）</div>
+            </div>
+            <div id="chatList" class="chat-list"></div>
+            <div id="voiceStatusText" class="meta">语音输入状态：未启动</div>
+            <div class="composer-shell">
+              <textarea id="chatInput" placeholder="输入你的教学需求，支持持续对话补充细节..."></textarea>
+              <div class="composer-footer">
+                <div class="composer-generate">
+                  <button id="generatePptBtn" class="btn btn-light">生成 PPT</button>
+                  <button id="generateDocBtn" class="btn btn-light">生成教案</button>
+                </div>
+                <div class="composer-tools">
+                  <button id="attachBtn" class="btn btn-icon" title="上传资料" type="button">📎</button>
+                  <button id="voiceInputBtn" class="btn btn-light btn-icon" type="button">🎙️</button>
+                  <button id="sendBtn" class="btn btn-primary">发送</button>
+                </div>
+              </div>
+            </div>
+            <input id="fileInput" type="file" multiple accept=".pdf,.ppt,.pptx,.png,.jpg,.jpeg,.bmp,.docx,.doc,.mp4,.mov,.avi,.mkv,.webm" hidden />
           </div>
-        </div>
 
-        <div id="slotBoard" class="slot-board"></div>
-        <div class="template-quickbar">
-          <button id="toggleTemplatePickerBtn" class="ghost-btn small-btn" disabled>选择模板（可收起）</button>
-          <div id="selectedTemplateText" class="meta">尚未选择模板（将自动使用推荐模板）</div>
-        </div>
-        <div id="chatList" class="chat-list"></div>
-
-        <div class="composer">
-          <textarea id="chatInput" placeholder="例如：课程主题：导数的定义与几何意义；知识点：极限思想与导数计算；重难点：导数定义理解；课时：1课时；风格：学术风。"></textarea>
-          <div class="composer-actions">
-            <button id="voiceInputBtn" class="ghost-btn" type="button">🎙️ 语音输入</button>
-            <button id="sendBtn" class="primary-btn">发送消息</button>
+          <div class="chat-side-card">
+            <h3>已上传资料</h3>
+            <div class="meta">通过输入框左侧回形针上传（与对话融合）</div>
+            <div id="uploadResults" class="info-list empty">还没有上传任何资料（建议优先上传高数相关内容）。</div>
           </div>
-          <div id="voiceStatusText" class="meta">语音输入状态：未启动</div>
         </div>
       </section>
 
-  <section class="panel equal-panel">
-        <div class="panel-head">
-          <div>
-            <p class="section-tag">02 A04 Demo 资料解析</p>
-            <h2>上传高数相关 PDF / PPT / 图片 / Word / 视频</h2>
-          </div>
-        </div>
-
-        <div class="upload-box">
-          <input id="fileInput" type="file" multiple accept=".pdf,.ppt,.pptx,.png,.jpg,.jpeg,.bmp,.docx,.doc,.mp4,.mov,.avi,.mkv,.webm" />
-          <button id="uploadBtn" class="ghost-btn">上传并解析高数资料</button>
-        </div>
-        <div id="uploadResults" class="info-list empty">还没有上传任何资料。</div>
-      </section>
-
-      <section class="action-dock">
-  <button id="newSessionBtn" class="primary-btn">创建新会话（Demo）</button>
-        <button id="generatePptBtn" class="ghost-btn">生成 PPT</button>
-        <button id="generateDocBtn" class="ghost-btn">生成教案</button>
-      </section>
-
-      <section class="panel wide">
-        <div class="panel-head">
-          <div>
-            <p class="section-tag">03 A04 Demo 生成区</p>
-            <h2>高数课件/教案生成控制与结果</h2>
-          </div>
+      <section id="resultView" class="workspace-view">
+        <div class="result-toolbar">
+          <button id="backToChatBtn" class="btn btn-light">返回对话</button>
+          <button id="newSessionBtn" class="btn btn-primary">新对话</button>
         </div>
 
         <div class="preview-grid">
           <div class="preview-card">
-            <h3>资料融入说明（高数优先）</h3>
-            <div id="retrievalList" class="info-list empty">生成后会显示高数相关参考资料如何被融入课件/教案。</div>
+            <h3>资料融入说明</h3>
+            <div id="retrievalList" class="info-list empty">生成后会显示资料融入说明。</div>
           </div>
           <div class="preview-card">
-            <h3>导出文件（Demo）</h3>
-            <div id="downloadList" class="info-list empty">生成后会在这里提供下载入口（演示版）。</div>
+            <h3>导出文件</h3>
+            <div id="downloadList" class="info-list empty">生成后会在这里提供下载入口。</div>
           </div>
         </div>
 
         <div class="preview-card">
-          <h3>课件预览（PPT 略缩图）</h3>
+          <h3>课件预览（PPT）</h3>
           <div class="ppt-preview-split">
             <div id="pptThumbPreview" class="ppt-thumb-grid empty">生成后会在左侧显示 PPT 页面的缩略图（可滚动）。</div>
-            <div id="pptFocusPreview" class="ppt-focus-preview empty">点击左侧任意缩略图后，这里会显示该页的放大预览与详细标注。</div>
+            <div id="pptFocusPreview" class="ppt-focus-preview empty">点击左侧任意缩略图后，这里会显示该页的放大预览。</div>
           </div>
         </div>
 
         <div class="preview-card">
           <h3>教案预览（DOCX）</h3>
-          <div id="docPreview" class="info-list empty">生成后会显示教案结构预览：教学目标、方法、课堂活动、课后作业。</div>
+          <div id="docPreview" class="info-list empty">生成后会显示教案结构预览。</div>
         </div>
 
         <div class="preview-card">
-          <h3>生成摘要（总览）</h3>
-          <div id="lessonSummary" class="info-list empty">生成后会显示精简摘要与可编辑方向建议（偏高数场景）。</div>
+          <h3>生成摘要</h3>
+          <div id="lessonSummary" class="info-list empty">生成后会显示摘要与优化建议。</div>
         </div>
 
         <div class="preview-card">
@@ -120,9 +109,12 @@
           <div id="nextStepList" class="next-step-list empty">生成后会在这里告诉你下一步该点哪里。</div>
         </div>
 
-        <div class="revision-box">
-          <textarea id="revisionInput" placeholder="输入修改意见，例如：增加一个真实案例页，并把课堂练习改成分层任务。"></textarea>
-          <button id="reviseBtn" class="primary-btn" disabled>根据意见重新优化</button>
+        <div class="preview-card">
+          <h3>根据意见重新优化</h3>
+          <div class="revision-box">
+            <textarea id="revisionInput" placeholder="输入修改意见，例如：增加1页易错提醒，并补充分层作业。"></textarea>
+            <button id="reviseBtn" class="btn btn-primary" disabled>根据意见重新优化</button>
+          </div>
         </div>
       </section>
     </main>

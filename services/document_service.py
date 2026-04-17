@@ -5,6 +5,7 @@ from datetime import datetime
 import re
 import hashlib
 import subprocess
+import shutil
 from urllib.parse import quote
 
 from docx import Document
@@ -13,6 +14,7 @@ from docx.shared import Pt, RGBColor as DocRGBColor
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+from pptx.enum.text import MSO_AUTO_SIZE, MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt as PptPt
 
 
@@ -21,6 +23,17 @@ class DocumentExportService:
 
     TARGET_SLIDE_WIDTH = Inches(13.333)
     TARGET_SLIDE_HEIGHT = Inches(7.5)
+    TEMPLATE_MIN_BODY_LINES = 2
+    TEMPLATE_MIN_CHAR_CAPACITY = 80
+    PLACEHOLDER_HINTS = (
+        "add a main point",
+        "briefly elaborate",
+        "elaborate on",
+        "lorem ipsum",
+        "click to add",
+        "title",
+        "subtitle",
+    )
 
     THEMES = {
         "科技风": {"bg": (15, 24, 49), "soft": (26, 39, 74), "card": (244, 250, 255), "accent": (56, 194, 255), "text": (244, 248, 255), "dark_text": (23, 35, 57), "family": "neon"},
@@ -112,8 +125,22 @@ class DocumentExportService:
     def _build_ppt(self, file_path: Path, package: dict):
         style_signal = package.get("selected_template") or package.get("theme_style") or package.get("summary", {}).get("style") or "教育蓝"
         self._apply_theme(style_signal)
-        prs = self._create_presentation(package)
         slides = self._normalize_slides_for_ppt(package.get("slides", []))
+        template_name = str(package.get("selected_template") or "").strip()
+        template_path = self.external_templates.get(template_name)
+
+        if template_path and template_path.exists():
+            prs = Presentation(str(template_path))
+            prs.slide_width = self.TARGET_SLIDE_WIDTH
+            prs.slide_height = self.TARGET_SLIDE_HEIGHT
+            template_applied = self._apply_content_to_template(prs, package, slides)
+            if template_applied:
+                prs.save(str(file_path))
+                return
+
+        prs = Presentation()
+        prs.slide_width = self.TARGET_SLIDE_WIDTH
+        prs.slide_height = self.TARGET_SLIDE_HEIGHT
         for slide_data in slides:
             layout = slide_data.get("layout", "content")
             if layout == "cover":
@@ -130,19 +157,332 @@ class DocumentExportService:
                 self._add_content_slide(prs, slide_data)
         prs.save(str(file_path))
 
-    def _create_presentation(self, package: dict):
-        template_name = str(package.get("selected_template") or "").strip()
-        template_path = self.external_templates.get(template_name)
-        if template_path and template_path.exists():
-            prs = Presentation(str(template_path))
-            prs.slide_width = self.TARGET_SLIDE_WIDTH
-            prs.slide_height = self.TARGET_SLIDE_HEIGHT
-            self._clear_template_slides(prs)
-            return prs
-        prs = Presentation()
-        prs.slide_width = self.TARGET_SLIDE_WIDTH
-        prs.slide_height = self.TARGET_SLIDE_HEIGHT
-        return prs
+    def _apply_content_to_template(self, prs: Presentation, package: dict, slides: list[dict]) -> bool:
+        if not slides:
+            return True
+
+        if len(prs.slide_layouts) == 0:
+            return False
+
+        if len(prs.slides) == 0:
+            default_layout = prs.slide_layouts[0]
+            for _ in slides:
+                prs.slides.add_slide(default_layout)
+        elif len(prs.slides) < len(slides):
+            for index in range(len(prs.slides), len(slides)):
+                layout = prs.slide_layouts[min(index, len(prs.slide_layouts) - 1)]
+                prs.slides.add_slide(layout)
+
+        for index, slide_data in enumerate(slides):
+            text_lines = self._build_template_text_lines(slide_data, package, index=index, total=len(slides))
+            if not self._template_slide_has_enough_capacity(prs.slides[index], text_lines):
+                return False
+            self._fill_template_slide_text(prs.slides[index], text_lines)
+
+        for index in range(len(prs.slides) - 1, len(slides) - 1, -1):
+            self._remove_slide_at(prs, index)
+
+        return True
+
+    def _template_slide_has_enough_capacity(self, slide, text_lines: list[str]) -> bool:
+        title_shape, body_shapes = self._collect_text_shapes(slide)
+        if not title_shape and not body_shapes:
+            return False
+
+        body_lines = [line for line in (text_lines[1:] if len(text_lines) > 1 else []) if str(line or "").strip()]
+        if not body_lines:
+            return True
+
+        if not body_shapes:
+            return False
+
+        line_capacity = sum(self._estimate_shape_line_capacity(shape) for shape in body_shapes)
+        char_capacity = sum(self._estimate_shape_char_capacity(shape) * self._estimate_shape_line_capacity(shape) for shape in body_shapes)
+        needed_lines = min(len(body_lines), 6)
+        needed_chars = sum(len(str(line)) for line in body_lines)
+
+        if line_capacity < max(self.TEMPLATE_MIN_BODY_LINES, needed_lines):
+            return False
+        if char_capacity < max(self.TEMPLATE_MIN_CHAR_CAPACITY, int(needed_chars * 0.65)):
+            return False
+        return True
+
+    def _build_template_text_lines(self, slide_data: dict, package: dict, *, index: int, total: int) -> list[str]:
+        layout = str(slide_data.get("layout") or "content")
+        title = self._compact_text(slide_data.get("title") or f"第 {index + 1} 页", max_len=40)
+        bullets = [self._compact_text(item, max_len=68) for item in (slide_data.get("bullets") or [])]
+        bullets = [item for item in bullets if item]
+        summary = package.get("summary") or {}
+        supplemental = [
+            self._compact_text(f"知识点：{summary.get('knowledge_points', '')}", max_len=68),
+            self._compact_text(f"重难点：{summary.get('key_difficulties', '')}", max_len=68),
+        ]
+        supplemental = [item for item in supplemental if item and not item.endswith("：")]
+
+        if layout == "cover":
+            return [
+                package.get("title") or title,
+                f"课程主题：{summary.get('course_theme', '')}",
+                f"知识点：{summary.get('knowledge_points', '')}",
+                f"课时安排：{summary.get('lesson_periods', '')}",
+            ]
+        if layout == "summary":
+            closing = [self._compact_text(item, max_len=68) for item in (package.get("closing_points") or [])]
+            closing = [item for item in closing if item]
+            expanded = self._expand_content_lines([*bullets, *closing, *supplemental], min_count=6, max_count=10)
+            return [title, *expanded]
+        if layout == "agenda":
+            numbered = [f"{i + 1}. {item}" for i, item in enumerate(bullets[:8])]
+            return [title, *numbered]
+
+        expanded = self._expand_content_lines([*bullets, *supplemental], min_count=6, max_count=10)
+        return [title, *expanded]
+
+    def _fill_template_slide_text(self, slide, text_lines: list[str]):
+        title_shape, body_shapes = self._collect_text_shapes(slide)
+        if not title_shape and not body_shapes:
+            return
+
+        title = (text_lines[0] if text_lines else "")
+        body_lines = text_lines[1:] if len(text_lines) > 1 else []
+
+        if title_shape:
+            self._set_shape_text(title_shape, [title], role="title")
+
+        if body_shapes:
+            body_groups = self._split_lines_by_shape_capacity(body_lines, body_shapes)
+            for idx, shape in enumerate(body_shapes, start=0):
+                group = body_groups[idx] if idx < len(body_groups) else []
+                if group:
+                    self._set_shape_text(shape, group, role="body")
+                elif getattr(shape, "is_placeholder", False) or self._looks_like_placeholder_text(self._extract_shape_text(shape)):
+                    self._set_shape_text(shape, [], role="body")
+
+    def _collect_text_shapes(self, slide):
+        min_width = int(Inches(1.8))
+        min_height = int(Inches(0.35))
+        ignore_narrow_width = int(Inches(1.2))
+        ignore_narrow_height = int(Inches(2.4))
+
+        title_candidates = []
+        body_candidates = []
+        neutral_candidates = []
+
+        for shape in slide.shapes:
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            width = getattr(shape, "width", 0)
+            height = getattr(shape, "height", 0)
+            if width <= 0 or height <= 0:
+                continue
+
+            # 过滤装饰性竖排细条文本框，避免出现“文字竖排挤压”问题。
+            if width <= ignore_narrow_width and height >= ignore_narrow_height:
+                continue
+
+            if width < min_width or height < min_height:
+                continue
+
+            current_text = self._extract_shape_text(shape)
+            placeholder_kind = self._placeholder_kind(shape)
+            if placeholder_kind == "title":
+                title_candidates.append(shape)
+                continue
+            if placeholder_kind == "body":
+                body_candidates.append(shape)
+                continue
+            if self._looks_like_placeholder_text(current_text):
+                body_candidates.append(shape)
+                continue
+            neutral_candidates.append(shape)
+
+        sort_key = lambda shp: (int(getattr(shp, "top", 0)), int(getattr(shp, "left", 0)), -int(getattr(shp, "width", 0) * getattr(shp, "height", 0)))
+        title_candidates.sort(key=sort_key)
+        body_candidates.sort(key=sort_key)
+        neutral_candidates.sort(key=sort_key)
+
+        title_shape = title_candidates[0] if title_candidates else (neutral_candidates[0] if neutral_candidates else None)
+
+        body_shapes = list(body_candidates)
+        for shape in neutral_candidates:
+            if shape is title_shape:
+                continue
+            body_shapes.append(shape)
+
+        # 控制正文文本框数量，避免把大量装饰文本都写满。
+        body_shapes = body_shapes[:6]
+        return title_shape, body_shapes
+
+    def _placeholder_kind(self, shape):
+        if not getattr(shape, "is_placeholder", False):
+            return "neutral"
+        try:
+            ph_name = str(getattr(shape.placeholder_format.type, "name", "")).upper()
+        except Exception:
+            ph_name = ""
+        if "TITLE" in ph_name:
+            return "title"
+        if any(token in ph_name for token in ("BODY", "OBJECT", "CONTENT", "SUBTITLE", "TEXT")):
+            return "body"
+        return "neutral"
+
+    def _set_shape_text(self, shape, lines: list[str], role: str = "body"):
+        normalized = [re.sub(r"\s+", " ", str(line or "")).strip() for line in (lines or [])]
+        normalized = [line for line in normalized if line]
+        text_frame = shape.text_frame
+        text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+        text_frame.vertical_anchor = MSO_ANCHOR.TOP
+        text_frame.word_wrap = True
+        text_frame.margin_left = int(Inches(0.08))
+        text_frame.margin_right = int(Inches(0.08))
+        text_frame.margin_top = int(Inches(0.05))
+        text_frame.margin_bottom = int(Inches(0.05))
+        text_frame.clear()
+        if not normalized:
+            return
+
+        line_capacity = self._estimate_shape_line_capacity(shape)
+        char_capacity = self._estimate_shape_char_capacity(shape)
+        safe_lines = []
+        current_chars = 0
+        for line in normalized:
+            line_trim = self._compact_text(line, max_len=char_capacity)
+            if len(safe_lines) >= line_capacity:
+                break
+            if current_chars + len(line_trim) > char_capacity * max(2, line_capacity // 2):
+                break
+            safe_lines.append(line_trim)
+            current_chars += len(line_trim)
+
+        if not safe_lines:
+            safe_lines = [self._compact_text(normalized[0], max_len=max(12, char_capacity // 2))]
+
+        is_title = str(role or "body").lower() == "title"
+        base_font_size = PptPt(30 if is_title else 20)
+        if not is_title:
+            shape_height_in = float(getattr(shape, "height", 0)) / 914400.0
+            if shape_height_in <= 1.0:
+                base_font_size = PptPt(16)
+            elif shape_height_in <= 1.5:
+                base_font_size = PptPt(18)
+
+        for index, line in enumerate(safe_lines):
+            paragraph = text_frame.paragraphs[0] if index == 0 else text_frame.add_paragraph()
+            paragraph.text = line
+            paragraph.level = 0
+            paragraph.alignment = PP_ALIGN.LEFT if not is_title else PP_ALIGN.CENTER
+            paragraph.line_spacing = 1.18 if not is_title else 1.1
+            paragraph.space_before = PptPt(0)
+            paragraph.space_after = PptPt(3 if not is_title else 1)
+            paragraph.font.bold = bool(is_title)
+            paragraph.font.size = base_font_size
+
+    def _split_lines_by_shape_capacity(self, lines: list[str], shapes: list):
+        if not shapes:
+            return []
+        if not lines:
+            return [[] for _ in shapes]
+
+        estimated_caps = [self._estimate_shape_line_capacity(shape) for shape in shapes]
+        estimated_chars = [self._estimate_shape_char_capacity(shape) for shape in shapes]
+
+        groups = [[] for _ in shapes]
+        cursor = 0
+
+        # 第一轮：每个文本框至少分配一条，提升画面填充感。
+        for i in range(len(shapes)):
+            if cursor >= len(lines):
+                break
+            groups[i].append(lines[cursor])
+            cursor += 1
+
+        # 第二轮：按容量补充分配剩余文本。
+        while cursor < len(lines):
+            progress = False
+            for i, cap in enumerate(estimated_caps):
+                if cursor >= len(lines):
+                    break
+                if len(groups[i]) < cap:
+                    groups[i].append(lines[cursor])
+                    cursor += 1
+                    progress = True
+            if not progress:
+                break
+
+        # 仍有剩余时，将剩余要点压缩合并到最大正文框末尾，避免直接堆叠导致遮挡或丢失。
+        if cursor < len(lines):
+            biggest = max(range(len(shapes)), key=lambda idx: int(getattr(shapes[idx], "width", 0)) * int(getattr(shapes[idx], "height", 0)))
+            remaining = [self._compact_text(item, max_len=48) for item in lines[cursor:cursor + 5]]
+            remaining = [item for item in remaining if item]
+            if remaining:
+                merged = "；".join(remaining)
+                merged = self._compact_text(merged, max_len=max(24, estimated_chars[biggest] * 2))
+                groups[biggest].append(merged)
+
+        return groups
+
+    def _estimate_shape_line_capacity(self, shape) -> int:
+        height = int(getattr(shape, "height", 0))
+        line_height_emu = int(Inches(0.42))
+        return max(1, min(9, height // max(line_height_emu, 1)))
+
+    def _estimate_shape_char_capacity(self, shape) -> int:
+        width_in = max(1.0, float(getattr(shape, "width", 0)) / 914400.0)
+        # 中文投屏场景按保守估计，避免横向溢出。
+        return max(16, int(width_in * 9))
+
+    def _extract_shape_text(self, shape) -> str:
+        if not getattr(shape, "has_text_frame", False):
+            return ""
+        parts = []
+        for paragraph in shape.text_frame.paragraphs:
+            text = re.sub(r"\s+", " ", str(paragraph.text or "")).strip()
+            if text:
+                parts.append(text)
+        return " ".join(parts).strip()
+
+    def _looks_like_placeholder_text(self, text: str) -> bool:
+        source = str(text or "").strip().lower()
+        if not source:
+            return True
+        if any(hint in source for hint in self.PLACEHOLDER_HINTS):
+            return True
+        return False
+
+    def _expand_content_lines(self, lines: list[str], min_count: int = 6, max_count: int = 10) -> list[str]:
+        expanded = []
+        for line in lines:
+            clean = self._compact_text(line, max_len=70)
+            if not clean:
+                continue
+            expanded.append(clean)
+            segments = [re.sub(r"\s+", " ", seg).strip() for seg in re.split(r"[；;。]", clean) if re.sub(r"\s+", " ", seg).strip()]
+            for seg in segments:
+                if len(seg) >= 8 and seg not in expanded:
+                    expanded.append(self._compact_text(seg, max_len=62))
+            if len(expanded) >= max_count:
+                break
+
+        if len(expanded) < min_count and expanded:
+            base = list(expanded)
+            i = 0
+            while len(expanded) < min_count:
+                expanded.append(base[i % len(base)])
+                i += 1
+
+        dedup = []
+        for item in expanded:
+            if item not in dedup:
+                dedup.append(item)
+        return dedup[:max_count]
+
+    def _remove_slide_at(self, prs: Presentation, index: int):
+        if index < 0 or index >= len(prs.slides):
+            return
+        slide_id = prs.slides._sldIdLst[index]
+        rel_id = slide_id.rId
+        prs.part.drop_rel(rel_id)
+        prs.slides._sldIdLst.remove(slide_id)
 
     def _normalize_slides_for_ppt(self, slides: list[dict]):
         max_bullets = {
@@ -207,8 +547,34 @@ class DocumentExportService:
         if urls:
             return urls
 
-        src = str(ppt_path)
-        out_dir = str(self.preview_dir)
+        export_source_path = ppt_path
+        temp_source_path = None
+        if any(ord(ch) > 127 for ch in str(ppt_path)):
+            temp_source_path = self.preview_dir / f"thumb_src_{digest}.pptx"
+            try:
+                shutil.copy2(ppt_path, temp_source_path)
+                export_source_path = temp_source_path
+            except Exception:
+                export_source_path = ppt_path
+
+        src = str(export_source_path.resolve())
+        out_dir = str(self.preview_dir.resolve())
+        if self._export_thumbnails_via_win32com(Path(src), digest=digest, max_count=max_count):
+            urls = []
+            for index in range(1, max_count + 1):
+                target_name = f"ppt_{digest}_{index:03d}.png"
+                target_path = self.preview_dir / target_name
+                if not target_path.exists():
+                    break
+                urls.append(f"/static/generated_ppt_previews/{quote(target_name)}")
+            if urls:
+                if temp_source_path and temp_source_path.exists():
+                    try:
+                        temp_source_path.unlink()
+                    except OSError:
+                        pass
+                return urls
+
         src_ps = src.replace("'", "''")
         out_dir_ps = out_dir.replace("'", "''")
         script = (
@@ -216,31 +582,34 @@ class DocumentExportService:
             "$ppt=$null; $pres=$null;"
             "try {"
             "$ppt=New-Object -ComObject PowerPoint.Application;"
-            "$ppt.Visible=0;"
             f"$pres=$ppt.Presentations.Open('{src_ps}', $false, $true, $false);"
             f"$max=[Math]::Min($pres.Slides.Count,{max_count});"
             "for($i=1; $i -le $max; $i++){"
             f"$name=('ppt_{digest}_' + $i.ToString('000') + '.png');"
             f"$target=Join-Path '{out_dir_ps}' $name;"
-            "$pres.Slides.Item($i).Export($target,'PNG',1280,720);"
+            "$pres.Slides.Item($i).Export($target,'PNG',960,540);"
             "}"
             "Write-Output $max;"
             "} finally {"
-            "if($pres -ne $null){$pres.Close()}"
-            "if($ppt -ne $null){$ppt.Quit()}"
+            "if($pres -ne $null){try{$pres.Close()}catch{}}"
+            "if($ppt -ne $null){try{$ppt.Quit()}catch{}}"
             "}"
         )
         try:
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", script],
+                ["powershell", "-NoProfile", "-STA", "-Command", script],
                 capture_output=True,
                 text=True,
-                timeout=25,
+                timeout=60,
             )
-            if result.returncode != 0:
-                return []
         except Exception:
             return []
+        finally:
+            if temp_source_path and temp_source_path.exists():
+                try:
+                    temp_source_path.unlink()
+                except OSError:
+                    pass
 
         urls = []
         for index in range(1, max_count + 1):
@@ -251,12 +620,47 @@ class DocumentExportService:
             urls.append(f"/static/generated_ppt_previews/{quote(target_name)}")
         return urls
 
-    def _clear_template_slides(self, prs: Presentation):
-        slide_ids = list(prs.slides._sldIdLst)
-        for slide_id in slide_ids:
-            rel_id = slide_id.rId
-            prs.part.drop_rel(rel_id)
-            prs.slides._sldIdLst.remove(slide_id)
+    def _export_thumbnails_via_win32com(self, source_path: Path, digest: str, max_count: int) -> bool:
+        try:
+            import pythoncom  # type: ignore
+            import win32com.client  # type: ignore
+        except Exception:
+            return False
+
+        app = None
+        presentation = None
+        initialized = False
+        try:
+            pythoncom.CoInitialize()
+            initialized = True
+            app = win32com.client.DispatchEx("PowerPoint.Application")
+            presentation = app.Presentations.Open(str(source_path.resolve()), False, True, False)
+            total = min(int(presentation.Slides.Count), int(max_count))
+            if total <= 0:
+                return False
+            for index in range(1, total + 1):
+                target_name = f"ppt_{digest}_{index:03d}.png"
+                target_path = self.preview_dir / target_name
+                presentation.Slides.Item(index).Export(str(target_path.resolve()), "PNG", 960, 540)
+            return True
+        except Exception:
+            return False
+        finally:
+            if presentation is not None:
+                try:
+                    presentation.Close()
+                except Exception:
+                    pass
+            if app is not None:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+            if initialized:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
 
     def _resolve_blank_layout(self, prs: Presentation):
         for layout in prs.slide_layouts:
@@ -470,7 +874,6 @@ class DocumentExportService:
             right.fill.solid()
             right.fill.fore_color.rgb = RGBColor(*self.theme["card"])
             right.line.fill.background()
-            frames = [left.text_frame, right.text_frame]
             targets = [(slide_data.get("bullets", [])[:2], left), (slide_data.get("bullets", [])[2:5], right)]
             for bullets, box in targets:
                 frame = box.text_frame

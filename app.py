@@ -129,6 +129,19 @@ def create_session():
     return jsonify(session_manager.create_session())
 
 
+@app.get("/api/sessions")
+def list_sessions():
+    return jsonify({"sessions": session_manager.list_sessions()})
+
+
+@app.get("/api/session/<session_id>")
+def get_session_detail(session_id: str):
+    session = session_manager.get_session(session_id)
+    if session is None:
+        return jsonify({"error": "会话不存在，请刷新页面后重试"}), 404
+    return jsonify(content_service.build_session_snapshot(session_id=session_id, session=session))
+
+
 @app.post("/api/chat")
 def chat():
     payload = request.get_json(force=True)
@@ -141,7 +154,9 @@ def chat():
     session = session_manager.get_session(session_id)
     if session is None:
         return jsonify({"error": "会话不存在，请刷新页面后重试"}), 404
-    return jsonify(content_service.handle_chat(session_id=session_id, session=session, user_message=message))
+    result = content_service.handle_chat(session_id=session_id, session=session, user_message=message)
+    session_manager.touch_session(session_id)
+    return jsonify(result)
 
 
 @app.post("/api/upload")
@@ -174,6 +189,7 @@ def upload_files():
             )
 
     session["documents"].extend(parsed_documents)
+    session_manager.touch_session(session_id)
     return jsonify(
         {
             "files": parsed_documents,
@@ -205,6 +221,7 @@ def generate_ppt():
     try:
         result = content_service.generate_ppt(session_id=session_id, session=session, selected_template=selected_template)
         state["generation_locked"] = True
+        session_manager.touch_session(session_id)
         return jsonify(result)
     finally:
         state["generating_ppt"] = False
@@ -231,6 +248,7 @@ def generate_docx():
     try:
         result = content_service.generate_doc(session_id=session_id, session=session, selected_template=selected_template)
         state["generation_locked"] = True
+        session_manager.touch_session(session_id)
         return jsonify(result)
     finally:
         state["generating_doc"] = False
@@ -256,13 +274,15 @@ def revise():
 
     state["revising"] = True
     try:
+        result = content_service.revise_teaching_package(
+            session_id=session_id,
+            session=session,
+            revision=revision,
+            selected_template=selected_template,
+        )
+        session_manager.touch_session(session_id)
         return jsonify(
-            content_service.revise_teaching_package(
-                session_id=session_id,
-                session=session,
-                revision=revision,
-                selected_template=selected_template,
-            )
+            result
         )
     finally:
         state["revising"] = False
@@ -274,4 +294,5 @@ def download_file(filename: str):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    debug_mode = str(os.getenv("APP_DEBUG", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    app.run(host="0.0.0.0", port=5000, debug=debug_mode, use_reloader=False)

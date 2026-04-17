@@ -128,6 +128,12 @@ class ContentService:
         key = f"{template_path.resolve()}::{stat.st_mtime_ns}::{stat.st_size}"
         digest = hashlib.md5(key.encode("utf-8")).hexdigest()
 
+        # 优先使用模板首页真实导出图，确保模板选择区看到的是“真实模板效果”。
+        if self.enable_com_thumbnail_fallback:
+            exported_cover = self._export_thumbnail_via_powerpoint(template_path, f"{digest}_cover")
+            if exported_cover:
+                return exported_cover
+
         candidates = (
             ("docProps/thumbnail.jpeg", ".jpg"),
             ("docProps/thumbnail.jpg", ".jpg"),
@@ -156,8 +162,13 @@ class ContentService:
         if target_path.exists():
             return f"/static/template_thumbs/{target_name}"
 
-        src = str(template_path)
-        dst = str(target_path)
+        src = str(template_path.resolve())
+        dst = str(target_path.resolve())
+
+        if self._export_template_thumbnail_via_win32com(template_path=Path(src), target_path=Path(dst)):
+            if target_path.exists():
+                return f"/static/template_thumbs/{target_name}"
+
         src_ps = src.replace("'", "''")
         dst_ps = dst.replace("'", "''")
         script = (
@@ -165,28 +176,65 @@ class ContentService:
             "$ppt=$null; $pres=$null;"
             "try {"
             "$ppt=New-Object -ComObject PowerPoint.Application;"
-            "$ppt.Visible=0;"
             f"$pres=$ppt.Presentations.Open('{src_ps}', $false, $true, $false);"
             "if($pres.Slides.Count -gt 0){"
             f"$pres.Slides.Item(1).Export('{dst_ps}','PNG',960,540);"
             "}"
             "} finally {"
-            "if($pres -ne $null){$pres.Close()}"
-            "if($ppt -ne $null){$ppt.Quit()}"
+            "if($pres -ne $null){try{$pres.Close()}catch{}}"
+            "if($ppt -ne $null){try{$ppt.Quit()}catch{}}"
             "}"
         )
         try:
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", script],
+                ["powershell", "-NoProfile", "-STA", "-Command", script],
                 capture_output=True,
                 text=True,
-                timeout=12,
+                timeout=20,
             )
             if result.returncode == 0 and target_path.exists():
                 return f"/static/template_thumbs/{target_name}"
         except Exception:
             return ""
         return ""
+
+    def _export_template_thumbnail_via_win32com(self, template_path: Path, target_path: Path) -> bool:
+        try:
+            import pythoncom  # type: ignore
+            import win32com.client  # type: ignore
+        except Exception:
+            return False
+
+        app = None
+        presentation = None
+        initialized = False
+        try:
+            pythoncom.CoInitialize()
+            initialized = True
+            app = win32com.client.DispatchEx("PowerPoint.Application")
+            presentation = app.Presentations.Open(str(template_path.resolve()), False, True, False)
+            if int(presentation.Slides.Count) <= 0:
+                return False
+            presentation.Slides.Item(1).Export(str(target_path.resolve()), "PNG", 960, 540)
+            return target_path.exists()
+        except Exception:
+            return False
+        finally:
+            if presentation is not None:
+                try:
+                    presentation.Close()
+                except Exception:
+                    pass
+            if app is not None:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+            if initialized:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
 
     def _infer_template_tags(self, name: str):
         source = str(name or "").lower()
@@ -506,6 +554,49 @@ class ContentService:
                 }
             )
         return {"slides": slides}
+
+    def build_session_snapshot(self, session_id: str, session: dict):
+        template_meta = self._template_meta(session)
+        snapshot = {
+            "session_id": session_id,
+            "messages": session.get("messages", []),
+            "slots": session.get("slots", {}),
+            "documents": session.get("documents", []),
+            "selected_template": session.get("selected_template", ""),
+            "template_suggestions": template_meta["suggestions"],
+            "recommended_template": template_meta["recommended"],
+            "template_catalog": self._template_catalog(template_meta["suggestions"]),
+            "has_result": bool(session.get("last_package")),
+        }
+        if not session.get("last_package"):
+            return snapshot
+
+        package = (session.get("last_package") or {}).get("package") or {}
+        downloads = (session.get("last_package") or {}).get("files") or {}
+        slide_thumbnail_urls = []
+        if downloads.get("pptx"):
+            slide_thumbnail_urls = self.export_service.build_ppt_slide_thumbnails(downloads["pptx"])
+        snapshot["result"] = {
+            "package": package,
+            "downloads": downloads,
+            "ppt_preview": self._build_ppt_preview(package, slide_thumbnail_urls),
+            "doc_preview": self.export_service.build_doc_preview(package),
+            "api_mode": "online" if self.llm_client.configured else "fallback",
+            "template_suggestions": template_meta["suggestions"],
+            "recommended_template": template_meta["recommended"],
+            "selected_template": session.get("selected_template", ""),
+            "template_catalog": self._template_catalog(template_meta["suggestions"]),
+            "reference_digest": [
+                {
+                    "title": "资料融入摘要",
+                    "score": "",
+                    "summary": item,
+                    "highlights": ["历史会话恢复"],
+                }
+                for item in (package.get("references") or [])[:6]
+            ],
+        }
+        return snapshot
 
     def _template_meta(self, session: dict):
         style = str(session["slots"].get("style", ""))
