@@ -166,6 +166,11 @@ input {
   display: block;
 }
 
+#resultView {
+  --revision-float-height: 214px;
+  padding-bottom: calc(16px + var(--revision-float-height));
+}
+
 .chat-layout {
   display: grid;
   grid-template-columns: 1fr 320px;
@@ -262,6 +267,16 @@ input {
   gap: 10px;
 }
 
+.composer-shell.locked {
+  background: #f7f9fe;
+  border-color: var(--line-strong);
+}
+
+.composer-shell.locked textarea,
+.composer-shell.locked .btn {
+  opacity: 0.68;
+}
+
 .composer-shell textarea {
   border: none;
   border-radius: 10px;
@@ -277,23 +292,92 @@ input {
 .composer-footer {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 10px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+}
+
+.composer-status-inline {
+  flex: 1;
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .composer-generate {
   display: flex;
   gap: 8px;
   margin-left: auto;
-  order: 2;
 }
 
 .composer-tools {
   display: flex;
   gap: 8px;
   align-items: center;
-  order: 3;
+}
+
+.composer-guard-hint {
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-top: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.composer-guard-hint.warn {
+  color: #1f67ff;
+}
+
+.composer-guard-hint.locked {
+  color: #c26a00;
+  font-weight: 600;
+}
+
+.ppt-loading {
+  display: none;
+  width: min(420px, 100%);
+}
+
+.ppt-loading.active {
+  display: block;
+}
+
+.ppt-loading-track {
+  position: relative;
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  background: #e8eefb;
+  overflow: hidden;
+  border: 1px solid #d4e0f7;
+}
+
+.ppt-loading-fill {
+  position: absolute;
+  top: 0;
+  left: -35%;
+  width: 35%;
+  height: 100%;
+  background: linear-gradient(90deg, #2b6cf6, #56a3ff);
+  border-radius: 999px;
+  animation: ppt-loading-slide 1.25s ease-in-out infinite;
+}
+
+.ppt-loading-text {
+  margin-top: 4px;
+  font-size: 0.74rem;
+  color: #2b6cf6;
+}
+
+@keyframes ppt-loading-slide {
+  0% {
+    left: -35%;
+  }
+  100% {
+    left: 100%;
+  }
 }
 
 textarea {
@@ -318,6 +402,16 @@ textarea {
 
 .btn:hover {
   border-color: var(--brand);
+}
+
+.btn:disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
+  border-color: var(--line);
+}
+
+.btn:disabled:hover {
+  border-color: var(--line);
 }
 
 .btn-primary {
@@ -575,6 +669,40 @@ textarea {
   min-height: 96px;
 }
 
+.revision-floating-panel {
+  position: fixed;
+  left: calc(280px + 16px);
+  right: 16px;
+  bottom: calc(10px + env(safe-area-inset-bottom));
+  z-index: 40;
+  margin-top: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(6px);
+  box-shadow: 0 -6px 24px rgba(20, 56, 115, 0.12);
+  padding: 12px;
+}
+
+.revision-floating-head {
+  margin-bottom: 8px;
+  font-weight: 700;
+  font-size: 0.95rem;
+}
+
+.revision-floating-panel .revision-box {
+  align-items: stretch;
+}
+
+.revision-floating-panel .revision-box textarea {
+  min-height: 88px;
+  max-height: 160px;
+}
+
+.revision-floating-panel .revision-box .btn {
+  min-width: 172px;
+}
+
 .result-toolbar {
   display: flex;
   gap: 8px;
@@ -715,11 +843,44 @@ textarea {
   .composer-footer {
     flex-direction: column;
     align-items: stretch;
+    gap: 8px;
+  }
+
+  .composer-status-inline {
+    width: 100%;
+    min-width: 0;
   }
 
   .composer-generate,
   .composer-tools {
     width: 100%;
     justify-content: flex-end;
+  }
+
+  .composer-guard-hint {
+    white-space: normal;
+  }
+
+  .ppt-loading {
+    width: 100%;
+  }
+
+  #resultView {
+    --revision-float-height: 248px;
+  }
+
+  .revision-floating-panel {
+    left: 12px;
+    right: 12px;
+    bottom: calc(8px + env(safe-area-inset-bottom));
+  }
+
+  .revision-floating-panel .revision-box {
+    flex-direction: column;
+  }
+
+  .revision-floating-panel .revision-box .btn {
+    width: 100%;
+    min-width: 0;
   }
 }

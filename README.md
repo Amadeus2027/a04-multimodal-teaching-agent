@@ -1,6 +1,8 @@
-# A04 多模态AI互动式教学智能体 Demo（高数助攻版）
+# A04 多模态AI互动式教学智能体 Demo（高数版）
 
-版本：`v1.13.0`
+[![zread](https://img.shields.io/badge/Ask_Zread-_.svg?style=flat&color=00b0aa&labelColor=000000&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjc1ODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff)](https://zread.ai/Amadeus2027/a04-multimodal-teaching-agent)                   
+
+版本：`v1.15.0`
 
 这是一个可独立运行的 Flask Web 项目，支持：
 
@@ -13,6 +15,7 @@
 - 对视频执行“关键帧 OCR + 离线音频转文字”联合解析
 - 在需求完成后自动推荐 PPT 模板，并支持教师手动选择
 - 支持项目内 `RAG/` 目录自动扫描入库，作为全局专业知识库
+- 支持“知识演示 HTML → 自动录制 MP4 → 嵌入 PPT 演示页（含可点击开源演示链接）”
 
 ## 技术栈
 
@@ -23,6 +26,7 @@
 - 向量库：`faiss-cpu`
 - 文件处理：`PyPDF2`、`PyMuPDF`、`easyocr`、`python-pptx`、`python-docx`、`opencv-python-headless`
 - 离线音频转写：`vosk` + `imageio-ffmpeg`
+- 知识演示视频生成：`Phaser.js` + `Playwright`（Python）
 
 ## 运行步骤
 
@@ -30,6 +34,7 @@
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+playwright install chromium
 Copy-Item .env.example .env
 python app.py
 ```
@@ -53,7 +58,54 @@ http://127.0.0.1:5000
 
 > 维护规则：`README` 仅记录重要功能/体验迭代；小修复不逐条单列，按阶段定期归并到“近期版本聚合”，避免日志噪声。
 
-### v1.13.0（当前）
+### v1.15.0（当前）
+
+- 方向升级：将原“互动小游戏 MP4”升级为“知识演示型 MP4”，演示内容以概念渐进、过程推演、参数图像变化为主，更贴合课堂讲授。
+- 意图识别扩展：新增“演示视频/知识演示/动态演示/可视化”等触发词，自动补入“知识演示”页面并生成对应视频资产。
+- PPT 外链增强：在演示页新增可点击开源链接区，内置 `GeoGebra`、`Desmos`、`Math3D`、`Wolfram Demonstrations`，便于课上延伸展示。
+
+### v1.14.0
+
+- 生成流程解锁修复：修正“首次生成后按钮永久锁住”问题；当前会话在生成完成后可继续对话并再次生成 `PPT/教案`（仍保留“生成中互斥”保护）。
+- 互动页兜底增强：当教师意图中包含“动画/互动/小游戏”等需求但 LLM 未产出 `interactive` 页时，系统会自动补入一页标准互动页，确保互动链路可执行。
+- 视频嵌入稳定性修复：`PPT` 互动页改为先生成海报帧再 `add_movie()` 嵌入 `MP4`，显著降低嵌入失败回退为纯文本卡片的概率。
+- 互动演示链路完善：维持“HTML 互动游戏 + Playwright 录制 + MP4 嵌入”的端到端容错，单步失败不影响整份课件导出。
+
+### v1.13.6（当前）
+
+- 输入区布局优化：将“生成阶段提示文案”与“发送/生成按钮”整合到同一行，减少视线跳转，提升操作连贯性。
+- PPT 生成进度提示：新增输入区 `PPT` 生成 loading 条（动画进度轨 + 文案），生成期间可直观看到任务进行中状态。
+- 响应式适配补充：桌面端保持同排紧凑布局，移动端自动折行为纵向结构，确保提示文案与 loading 条在小屏可读、可操作。
+
+### v1.13.5
+
+- 生成前置校验：新增“关键信息补全后才能生成”约束，未完成 `课程主题/知识点/重难点/课时安排/课件风格` 时，前后端都会阻止生成并提示缺失项。
+- 生成互斥控制：生成 PPT/教案期间，禁止继续对话、上传资料和触发另一项生成；后端接口增加并发保护，避免并行请求导致状态冲突。
+- UI 适配增强：输入区新增“生成门禁提示”与“生成中锁定态”（按钮/输入框禁用与文案提示），让不可操作原因可见、可理解。
+
+### v1.13.4
+
+- 排版一致性修复：统一 PPT 正文段落样式（同级统一 `level=0`、左对齐、统一行距与段后距），修复同一层级内容出现“首行/其余行缩进不一致”的问题。
+- 内容充实增强：在导出归一化阶段增加要点补强策略（content/case/summary 默认扩展到 6-7 条，interactive 到 4 条），自动补入“方法提示/易错提醒/反馈”信息，减少页面单薄。
+- 生成策略增强：LLM 提示词新增页内密度约束（agenda/content/case/summary 5-7 条、interactive 3-4 条），提升首次生成的内容完整度。
+
+### v1.13.3
+
+- 运行态修复：在 `services/document_service.py` 增加统一 `bullet` 提纯函数，程序化页面与模板导出链路统一走纯文本写入，彻底规避 `{'text':..., 'section_hint':...}` 字典字面量入页。
+- 模板降级门禁：模板写入前新增稳定性检测（旋转文本框/窄高文本框/可写容量），命中高风险模板时自动回退程序化稳定版式，优先保证“清晰可读、不东倒西歪”。
+- 导出兼容闭环：修复运行模块中结构化 bullet 解析分支，保证字典字符串与对象 bullet 均可落为纯文本。
+
+### v1.13.2
+
+- 文本清洗修复：针对 `{'text': '...', 'section_hint': '...'}` 被直接写进 PPT 的问题，新增 bullet 兼容清洗逻辑，支持对象/字典字符串两类输入并统一提纯为纯文本。
+- 导出兼容增强：当检测到旧版导出器不支持结构化 bullet 时，自动降级为“纯文本 bullets”导出，避免模板页出现字典字面量脏格式。
+
+### v1.13.1
+
+- 发布后流程固化：每次代码更新后默认执行三步收尾检查——①全局代码检查并评估无用接口清理；②更新 `README` 版本记录；③执行 `start_app.bat --check` 启动自检。
+- 维护约定补充：若未发现可安全删除的接口，明确记录“本轮无可删除项”，避免误删外部依赖入口。
+
+### v1.13.0
 
 - 模板排版引擎升级：优化“标题区 + 正文区”识别与文本分配逻辑，降低错位写入导致的文本重叠。
 - 投屏可读性增强：正文文本框启用自动缩放、边距约束、容量估算与逐框截断，减少溢出与遮挡。

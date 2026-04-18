@@ -47,6 +47,15 @@
             <div class="composer-shell">
               <textarea id="chatInput" placeholder="输入你的教学需求，支持持续对话补充细节..."></textarea>
               <div class="composer-footer">
+                <div class="composer-status-inline">
+                  <div id="generationGuardHint" class="composer-guard-hint">请先补全课程主题、知识点、重难点、课时安排、课件风格后再生成。</div>
+                  <div id="pptLoadingBar" class="ppt-loading" aria-live="polite" aria-hidden="true">
+                    <div class="ppt-loading-track">
+                      <div class="ppt-loading-fill"></div>
+                    </div>
+                    <div class="ppt-loading-text">PPT 正在生成，请稍候…</div>
+                  </div>
+                </div>
                 <div class="composer-generate">
                   <button id="generatePptBtn" class="btn btn-light">生成 PPT</button>
                   <button id="generateDocBtn" class="btn btn-light">生成教案</button>
@@ -109,8 +118,8 @@
           <div id="nextStepList" class="next-step-list empty">生成后会在这里告诉你下一步该点哪里。</div>
         </div>
 
-        <div class="preview-card">
-          <h3>根据意见重新优化</h3>
+        <div class="revision-floating-panel" id="revisionFloatingPanel" aria-label="根据意见重新优化">
+          <div class="revision-floating-head">根据意见重新优化</div>
           <div class="revision-box">
             <textarea id="revisionInput" placeholder="输入修改意见，例如：增加1页易错提醒，并补充分层作业。"></textarea>
             <button id="reviseBtn" class="btn btn-primary" disabled>根据意见重新优化</button>

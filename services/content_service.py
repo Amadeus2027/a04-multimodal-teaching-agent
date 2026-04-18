@@ -2,21 +2,68 @@ from __future__ import annotations
 
 import json
 import re
+import ast
+import copy
+import types
 from pathlib import Path
 import hashlib
 import zipfile
 import subprocess
 import os
+from html import unescape
 from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
+from pptx.util import Inches
 
 from services.document_service import DocumentExportService
+from services.interactive_service import InteractiveService
 from services.session_manager import REQUIRED_FIELDS
+from services.video_renderer import VideoRenderer
 
 
 class ContentService:
     """Coordinates clarification, retrieval, instruction fusion, and package generation."""
 
-    CREATIVE_KEYWORDS = ["动画", "动效", "小游戏", "互动游戏", "闯关", "拖拽", "配对", "课堂互动", "创意"]
+    CREATIVE_KEYWORDS = ["动画", "动效", "小游戏", "互动游戏", "闯关", "拖拽", "配对", "课堂互动", "创意", "演示视频", "知识演示", "动态演示", "可视化", "geogebra", "desmos", "math3d", "wolfram", "链接页"]
+    OPEN_DEMO_LINKS = [
+        ("GeoGebra", "https://www.geogebra.org/"),
+        ("Desmos Calculator", "https://www.desmos.com/calculator"),
+        ("Math3D", "https://www.math3d.org/"),
+        ("Wolfram Demonstrations", "https://demonstrations.wolfram.com/"),
+    ]
+    OPEN_DEMO_SITES = [
+        {
+            "name": "GeoGebra",
+            "url": "https://www.geogebra.org/",
+            "search": "https://www.geogebra.org/search/{query}",
+            "default_summary": "覆盖函数图像、几何构造与课堂活动，适合做概念可视化与探究任务。",
+            "suggestions": ["函数图像动态演示", "参数变化观察", "课堂互动活动"],
+        },
+        {
+            "name": "Desmos Calculator",
+            "url": "https://www.desmos.com/calculator",
+            "search": "https://www.desmos.com/calculator",
+            "default_summary": "图形计算器响应快，适合展示函数、极限邻域变化与参数联动。",
+            "suggestions": ["函数与导数图像", "极限邻域放大", "参数滑块演示"],
+        },
+        {
+            "name": "Math3D",
+            "url": "https://www.math3d.org/",
+            "search": "https://www.math3d.org/",
+            "default_summary": "面向三维函数与曲面演示，可用于空间几何与多元函数直观讲解。",
+            "suggestions": ["三维曲面观察", "截面变化", "空间参数影响"],
+        },
+        {
+            "name": "Wolfram Demonstrations",
+            "url": "https://demonstrations.wolfram.com/",
+            "search": "https://demonstrations.wolfram.com/",
+            "default_summary": "汇集大量数学与科学交互演示，适合做拓展案例与课后探索。",
+            "suggestions": ["可视化案例拓展", "跨学科演示", "探究式作业素材"],
+        },
+    ]
 
     TEMPLATE_PROFILES = [
         {"name": "学术风", "scene": "概念讲解、推理证明、考试复习", "tags": ["学术", "严谨", "证明", "推理", "理论", "复习"]},
@@ -53,6 +100,14 @@ class ContentService:
         self.llm_client = llm_client
         self.rag_service = rag_service
         self.export_service = DocumentExportService(output_dir=output_dir)
+        self._ensure_interactive_movie_embedding_hook()
+        self.interactive_service = InteractiveService(llm_client=llm_client)
+        self.video_renderer = VideoRenderer(timeout_seconds=int(os.getenv("INTERACTIVE_RENDER_TIMEOUT_SECONDS", "45")))
+        self.interactive_assets_root = output_dir / "interactive_assets"
+        self.interactive_assets_root.mkdir(parents=True, exist_ok=True)
+        self.interactive_clip_duration = float(os.getenv("INTERACTIVE_CLIP_DURATION_SECONDS", "18"))
+        self.interactive_max_videos = max(0, int(os.getenv("INTERACTIVE_MAX_VIDEOS", "1")))
+        self._site_reference_cache = {}
         self.workspace_root = output_dir.parent
         self.template_thumb_dir = self.workspace_root / "static" / "template_thumbs"
         self.template_thumb_dir.mkdir(parents=True, exist_ok=True)
@@ -329,28 +384,262 @@ class ContentService:
         }
 
     def generate_ppt(self, session_id: str, session: dict, selected_template: str = ""):
-        package, retrievals, instruction_bundle = self._generate_package_core(session_id, session, revision="", selected_template=selected_template)
+        package, retrievals, instruction_bundle = self._generate_package_core(
+            session_id,
+            session,
+            revision="",
+            selected_template=selected_template,
+            include_interactive_media=True,
+        )
         exported = self.export_service.build_ppt(package)
         session["last_package"] = {"package": package, "files": exported}
         return self._build_package_response(session, package, retrievals, exported, instruction_bundle)
 
     def generate_doc(self, session_id: str, session: dict, selected_template: str = ""):
-        package, retrievals, instruction_bundle = self._generate_package_core(session_id, session, revision="", selected_template=selected_template)
-        exported = self.export_service.build_doc(package)
+        package, retrievals, instruction_bundle = self._generate_package_core(
+            session_id,
+            session,
+            revision="",
+            selected_template=selected_template,
+            include_interactive_media=False,
+        )
+        doc_safe_package = self._sanitize_package_for_doc_export(package)
+        exported = self.export_service.build_doc(doc_safe_package)
         session["last_package"] = {"package": package, "files": exported}
         return self._build_package_response(session, package, retrievals, exported, instruction_bundle)
 
     def revise_teaching_package(self, session_id: str, session: dict, revision: str, selected_template: str = ""):
         self._collect_creative_requests(session, revision)
-        package, retrievals, instruction_bundle = self._generate_package_core(session_id, session, revision=revision, selected_template=selected_template)
+        package, retrievals, instruction_bundle = self._generate_package_core(
+            session_id,
+            session,
+            revision=revision,
+            selected_template=selected_template,
+            include_interactive_media=True,
+        )
         package["applied_revision"] = revision
-        exported = self.export_service.build_package(package)
+        doc_safe_package = self._sanitize_package_for_doc_export(package)
+        exported = {}
+        exported.update(self.export_service.build_ppt(package))
+        exported.update(self.export_service.build_doc(doc_safe_package))
         session["last_package"] = {"package": package, "files": exported}
         response = self._build_package_response(session, package, retrievals, exported, instruction_bundle)
         response["revision_applied"] = revision
         return response
 
-    def _generate_package_core(self, session_id: str, session: dict, revision: str, selected_template: str):
+    def _sanitize_package_for_doc_export(self, package: dict):
+        safe_package = copy.deepcopy(package)
+        safe_slides = []
+        for slide in safe_package.get("slides") or []:
+            slide_copy = dict(slide)
+            bullets = []
+            for bullet in slide_copy.get("bullets") or []:
+                text, _ = self._normalize_bullet_item(bullet)
+                if text:
+                    bullets.append(text)
+            slide_copy["bullets"] = bullets
+            safe_slides.append(slide_copy)
+        safe_package["slides"] = safe_slides
+        return safe_package
+
+    def _ensure_interactive_movie_embedding_hook(self):
+        service = self.export_service
+
+        if not hasattr(service, "_apply_body_paragraph_style") and hasattr(service, "_format_body_paragraph"):
+            def _compat_apply(instance, paragraph, *, size_pt: float, bold: bool = False, color=None):
+                return instance._format_body_paragraph(paragraph, size_pt=size_pt, bold=bold, color=color)
+
+            service._apply_body_paragraph_style = types.MethodType(_compat_apply, service)
+
+        if not hasattr(service, "_format_body_paragraph") and hasattr(service, "_apply_body_paragraph_style"):
+            def _compat_format(instance, paragraph, *, size_pt: float, bold: bool = False, color=None):
+                return instance._apply_body_paragraph_style(paragraph, size_pt=size_pt, bold=bold, color=color)
+
+            service._format_body_paragraph = types.MethodType(_compat_format, service)
+
+        if getattr(service, "_interactive_movie_hook_installed", False):
+            return
+
+        original_build_ppt = service._build_ppt
+        original_add_interactive = service._add_interactive_slide
+        original_add_content = service._add_content_slide
+
+        def _wrapped_build_ppt(instance, file_path: Path, package: dict):
+            instance._active_export_package = package
+            return original_build_ppt(file_path, package)
+
+        def _find_asset(instance, package: dict, slide_data: dict, slide_index: int | None = None):
+            assets = package.get("interactive_assets") or []
+            if not isinstance(assets, list) or not assets:
+                return None
+            if slide_index is not None:
+                for item in assets:
+                    if int(item.get("slide_index", -1)) == int(slide_index):
+                        return item
+            normalized_title = str(slide_data.get("title") or "").strip()
+            if normalized_title:
+                for item in assets:
+                    if str(item.get("slide_title") or "").strip() == normalized_title:
+                        return item
+            return assets[0]
+
+        def _poster_path(instance):
+            from PIL import Image, ImageDraw
+
+            poster_dir = instance.output_dir / "interactive_assets" / "posters"
+            poster_dir.mkdir(parents=True, exist_ok=True)
+            path = poster_dir / "default_interactive_poster.png"
+            if path.exists():
+                return path
+            image = Image.new("RGB", (1280, 720), (42, 89, 182))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((60, 60, 1220, 660), outline=(255, 255, 255), width=4)
+            draw.text((110, 180), "课堂知识演示视频", fill=(255, 255, 255))
+            draw.text((110, 290), "播放方式：在 PPT 放映模式点击播放", fill=(235, 242, 255))
+            image.save(path)
+            return path
+
+        def _style_paragraph(instance, paragraph, *, size_pt: float, bold: bool = False, color=None):
+            styler = getattr(instance, "_apply_body_paragraph_style", None)
+            if callable(styler):
+                return styler(paragraph, size_pt=size_pt, bold=bold, color=color)
+            legacy_styler = getattr(instance, "_format_body_paragraph", None)
+            if callable(legacy_styler):
+                return legacy_styler(paragraph, size_pt=size_pt, bold=bold, color=color)
+            return None
+
+        def _add_open_demo_links(instance, slide):
+            box = slide.shapes.add_shape(
+                MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+                Inches(1.0),
+                Inches(6.0),
+                Inches(11.35),
+                Inches(0.95),
+            )
+            box.fill.solid()
+            box.fill.fore_color.rgb = RGBColor(*instance.theme["card"])
+            box.line.color.rgb = RGBColor(*instance.theme["accent"])
+
+            frame = box.text_frame
+            frame.clear()
+
+            title = frame.paragraphs[0]
+            title.text = "延伸学习链接（点击可访问）"
+            _style_paragraph(instance, title, size_pt=12, bold=True, color=instance.theme["accent"])
+
+            for idx, (label, url) in enumerate(self.OPEN_DEMO_LINKS):
+                p = frame.add_paragraph()
+                p.text = ""
+                run = p.add_run()
+                run.text = f"{idx + 1}. {label}"
+                run.hyperlink.address = url
+                _style_paragraph(instance, p, size_pt=11, color=instance.theme["dark_text"])
+
+        def _add_resource_links_slide(instance, prs, slide_data: dict):
+            slide = instance._add_blank_slide(prs)
+            instance._set_background(slide, instance.theme["soft"])
+            instance._add_top_band(slide)
+            instance._text_box(slide, 0.85, 0.55, 8.6, 0.8, slide_data.get("title") or "开源演示资源导航", 24, instance.theme["dark_text"], bold=True)
+
+            resources = list(slide_data.get("resources") or [])[:4]
+            if not resources:
+                active_package = getattr(instance, "_active_export_package", {}) or {}
+                resources = list(active_package.get("open_demo_references") or [])[:4]
+            if not resources:
+                resources = [
+                    {"name": label, "url": url, "summary": "用于课堂演示与课后拓展。", "teaching_hint": "建议结合本节主题进行定向检索。"}
+                    for label, url in self.OPEN_DEMO_LINKS
+                ]
+
+            card_w = 5.52
+            card_h = 2.28
+            positions = [(0.95, 1.55), (6.83, 1.55), (0.95, 4.05), (6.83, 4.05)]
+            for idx, item in enumerate(resources[:4]):
+                left, top = positions[idx]
+                card = slide.shapes.add_shape(
+                    MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE,
+                    Inches(left),
+                    Inches(top),
+                    Inches(card_w),
+                    Inches(card_h),
+                )
+                card.fill.solid()
+                card.fill.fore_color.rgb = RGBColor(*instance.theme["card"])
+                card.line.color.rgb = RGBColor(*instance.theme["accent"])
+
+                frame = card.text_frame
+                frame.clear()
+
+                name_p = frame.paragraphs[0]
+                name_p.text = str(item.get("name") or f"资源 {idx + 1}")
+                _style_paragraph(instance, name_p, size_pt=15, bold=True, color=instance.theme["accent"])
+
+                summary_p = frame.add_paragraph()
+                summary_p.text = str(item.get("summary") or "该网站可用于数学可视化演示。")[:90]
+                _style_paragraph(instance, summary_p, size_pt=12, color=instance.theme["dark_text"])
+
+                hint_p = frame.add_paragraph()
+                hint_p.text = f"课堂用法：{str(item.get('teaching_hint') or '作为拓展演示与讨论素材')}"[:100]
+                _style_paragraph(instance, hint_p, size_pt=11, color=instance.theme["dark_text"])
+
+                link_p = frame.add_paragraph()
+                link_p.text = ""
+                link_run = link_p.add_run()
+                link_run.text = "🔗 打开链接"
+                link_run.hyperlink.address = str(item.get("url") or "")
+                _style_paragraph(instance, link_p, size_pt=12, bold=True, color=instance.theme["accent"])
+
+        def _wrapped_add_interactive(instance, prs, slide_data: dict, package: dict | None = None, slide_index: int | None = None):
+            resolved_package = package if isinstance(package, dict) else getattr(instance, "_active_export_package", {})
+            asset = _find_asset(instance, resolved_package, slide_data, slide_index)
+            if not asset:
+                return original_add_interactive(prs, slide_data)
+
+            video_path = Path(str(asset.get("video_path") or "").strip())
+            if not video_path.exists() or video_path.suffix.lower() != ".mp4":
+                return original_add_interactive(prs, slide_data)
+
+            slide = instance._add_blank_slide(prs)
+            instance._set_background(slide, instance.theme["soft"])
+            instance._add_top_band(slide)
+            instance._text_box(slide, 0.85, 0.55, 7.0, 0.8, slide_data.get("title") or "互动页", 24, instance.theme["dark_text"], bold=True)
+
+            try:
+                poster = _poster_path(instance)
+                slide.shapes.add_movie(
+                    str(video_path.resolve()),
+                    Inches(1.0),
+                    Inches(1.55),
+                    Inches(11.35),
+                    Inches(4.35),
+                    str(poster.resolve()),
+                    "video/mp4",
+                )
+                caption = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(1.0), Inches(5.95), Inches(11.35), Inches(0.38))
+                caption.fill.solid()
+                caption.fill.fore_color.rgb = RGBColor(*instance.theme["card"])
+                caption.line.fill.background()
+                frame = caption.text_frame
+                frame.clear()
+                p = frame.paragraphs[0]
+                p.text = f"知识演示视频：{asset.get('slide_title') or slide_data.get('title') or '演示环节'}"
+                _style_paragraph(instance, p, size_pt=11, color=instance.theme["dark_text"])
+                _add_open_demo_links(instance, slide)
+                return
+            except Exception:
+                return original_add_interactive(prs, slide_data)
+
+        def _wrapped_add_content(instance, prs, slide_data: dict):
+            if str(slide_data.get("layout") or "").strip().lower() == "resource_links":
+                return _add_resource_links_slide(instance, prs, slide_data)
+            return original_add_content(prs, slide_data)
+
+        service._build_ppt = types.MethodType(_wrapped_build_ppt, service)
+        service._add_interactive_slide = types.MethodType(_wrapped_add_interactive, service)
+        service._add_content_slide = types.MethodType(_wrapped_add_content, service)
+        service._interactive_movie_hook_installed = True
+
+    def _generate_package_core(self, session_id: str, session: dict, revision: str, selected_template: str, include_interactive_media: bool = True):
         template_meta = self._template_meta(session)
         if selected_template and selected_template in self.template_names:
             session["selected_template"] = selected_template
@@ -369,8 +658,305 @@ class ContentService:
         )
         instruction_bundle = self._build_instruction_bundle(session, retrievals, revision, session["selected_template"])
         package = self._build_package(session=session, retrievals=retrievals, instruction_bundle=instruction_bundle)
+        package = self._ensure_interactive_slide(package=package, instruction_bundle=instruction_bundle)
+        open_demo_references = []
+        if self._has_open_resource_intent(instruction_bundle):
+            open_demo_references = self._build_open_demo_references(instruction_bundle)
+            package["open_demo_references"] = open_demo_references
+            package = self._ensure_open_demo_resource_slide(package=package, references=open_demo_references)
+        if include_interactive_media:
+            package["interactive_assets"] = self._build_interactive_assets(
+                session_id=session_id,
+                package=package,
+                instruction_bundle=instruction_bundle,
+            )
         package["instruction_bundle"] = instruction_bundle
         return package, retrievals, instruction_bundle
+
+    def _build_interactive_assets(self, session_id: str, package: dict, instruction_bundle: dict):
+        interactive_slides = [
+            {"index": idx, "slide": slide}
+            for idx, slide in enumerate(package.get("slides") or [])
+            if str(slide.get("layout") or "").strip().lower() == "interactive"
+        ]
+        if not interactive_slides or self.interactive_max_videos <= 0:
+            return []
+        if not self._has_interactive_intent(instruction_bundle):
+            return []
+
+        topics = self._interactive_topics(package=package, instruction_bundle=instruction_bundle)
+        demo_type = self._interactive_demo_type(instruction_bundle)
+        target_dir = self.interactive_assets_root / self._safe_token(session_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        assets = []
+        for idx, record in enumerate(interactive_slides[: self.interactive_max_videos]):
+            slide_index = int(record["index"])
+            slide = record["slide"]
+            topic = topics[idx] if idx < len(topics) else topics[-1]
+            token_seed = f"{session_id}:{slide_index}:{topic}:{demo_type}"
+            token = self._safe_token(token_seed)
+
+            try:
+                html_path = Path(self.interactive_service.generate_demo(topic=topic, demo_type=demo_type, output_dir=target_dir))
+                video_path = target_dir / f"interactive_{token}.mp4"
+                rendered = self.video_renderer.render(
+                    html_path=html_path,
+                    output_path=video_path,
+                    duration=self.interactive_clip_duration,
+                )
+                assets.append(
+                    {
+                        "slide_index": slide_index,
+                        "slide_title": str(slide.get("title") or f"互动页 {slide_index + 1}"),
+                        "topic": topic,
+                        "demo_type": demo_type,
+                        "game_type": demo_type,
+                        "html_path": str(html_path.resolve()),
+                        "video_path": str(Path(rendered).resolve()),
+                    }
+                )
+            except Exception as exc:
+                assets.append(
+                    {
+                        "slide_index": slide_index,
+                        "slide_title": str(slide.get("title") or f"互动页 {slide_index + 1}"),
+                        "topic": topic,
+                        "demo_type": demo_type,
+                        "game_type": demo_type,
+                        "html_path": "",
+                        "video_path": "",
+                        "error": str(exc)[:180],
+                    }
+                )
+        return assets
+
+    def _ensure_interactive_slide(self, package: dict, instruction_bundle: dict):
+        slides = list(package.get("slides") or [])
+        has_interactive = any(str(item.get("layout") or "").strip().lower() == "interactive" for item in slides)
+        if has_interactive or not self._has_interactive_intent(instruction_bundle):
+            return package
+
+        teacher_intent = instruction_bundle.get("teacher_intent") or {}
+        topic = str(teacher_intent.get("course_theme") or "课堂知识点").strip() or "课堂知识点"
+        creative_requests = [str(item).strip() for item in (teacher_intent.get("creative_requests") or []) if str(item).strip()]
+        demo_type = self._interactive_demo_type(instruction_bundle)
+        demo_map = {
+            "concept": "概念渐进演示",
+            "timeline": "过程推演演示",
+            "graph": "参数动态图像演示",
+        }
+        demo_name = demo_map.get(demo_type, "知识演示")
+
+        slides.append(
+            {
+                "title": "知识演示",
+                "layout": "interactive",
+                "bullets": [
+                    {"text": f"演示类型：{demo_name}（围绕“{topic}”）", "section_hint": "main"},
+                    {"text": "目标：通过动态可视化帮助学生快速理解核心概念与变化规律。", "section_hint": "side"},
+                    {"text": f"教师要求：{'；'.join(creative_requests[:2]) or '强化概念理解与迁移应用'}", "section_hint": "note"},
+                ],
+            }
+        )
+        package["slides"] = slides
+        return package
+
+    def _ensure_open_demo_resource_slide(self, package: dict, references: list[dict]):
+        slides = list(package.get("slides") or [])
+        if not references:
+            package["slides"] = slides
+            return package
+
+        if any(str(item.get("layout") or "").strip().lower() == "resource_links" for item in slides):
+            package["slides"] = slides
+            return package
+
+        resource_slide = {
+            "title": "开源演示资源导航",
+            "layout": "resource_links",
+            "resources": references[:4],
+            "bullets": [
+                {
+                    "text": f"{item.get('name', '资源')}：{item.get('summary', '')}",
+                    "section_hint": "main",
+                }
+                for item in references[:4]
+            ],
+        }
+
+        inserted = False
+        new_slides = []
+        for item in slides:
+            if not inserted and str(item.get("layout") or "").strip().lower() == "summary":
+                new_slides.append(resource_slide)
+                inserted = True
+            new_slides.append(item)
+        if not inserted:
+            new_slides.append(resource_slide)
+
+        package["slides"] = new_slides
+        return package
+
+    def _build_open_demo_references(self, instruction_bundle: dict):
+        teacher_intent = instruction_bundle.get("teacher_intent") or {}
+        course_theme = str(teacher_intent.get("course_theme") or "").strip()
+        knowledge = str(teacher_intent.get("knowledge_points") or "").strip()
+        revision = str(teacher_intent.get("revision") or "").strip()
+        creative = " ".join(teacher_intent.get("creative_requests") or [])
+        topic = " ".join([item for item in [course_theme, knowledge, revision, creative] if item]).strip() or "高等数学"
+        cache_key = self._safe_token(topic)
+        if cache_key in self._site_reference_cache:
+            return self._site_reference_cache[cache_key]
+
+        refs = []
+        for site in self.OPEN_DEMO_SITES:
+            refs.append(
+                {
+                    "name": site["name"],
+                    "url": self._build_site_url(site, topic),
+                    "summary": self._site_summary(site, topic),
+                    "teaching_hint": self._site_teaching_hint(site, topic),
+                }
+            )
+
+        self._site_reference_cache[cache_key] = refs
+        return refs
+
+    def _has_open_resource_intent(self, instruction_bundle: dict):
+        teacher_intent = instruction_bundle.get("teacher_intent") or {}
+        corpus = " ".join(
+            [
+                str(teacher_intent.get("knowledge_points") or ""),
+                str(teacher_intent.get("revision") or ""),
+                " ".join(teacher_intent.get("creative_requests") or []),
+            ]
+        ).lower()
+        keywords = [
+            "演示", "可视化", "演示视频", "知识演示", "链接", "网站", "资源",
+            "geogebra", "desmos", "math3d", "wolfram",
+        ]
+        if any(token in corpus for token in keywords):
+            return True
+        return self._has_interactive_intent(instruction_bundle)
+
+    def _build_site_url(self, site: dict, topic: str):
+        template = str(site.get("search") or site.get("url") or "").strip()
+        if not template:
+            return ""
+        q = re.sub(r"\s+", " ", topic).strip()
+        if "{query}" in template:
+            return template.format(query=quote(q))
+        if "?" in template:
+            return template
+        if "geogebra.org" in template:
+            return f"{template.rstrip('/')}/search/{quote(q)}"
+        return template
+
+    def _site_summary(self, site: dict, topic: str):
+        default_text = str(site.get("default_summary") or "").strip() or "可用于课堂演示。"
+        title_text, desc_text = self._fetch_web_title_desc(str(site.get("url") or ""))
+        merged = "；".join([part for part in [title_text, desc_text] if part])
+        if merged:
+            merged = re.sub(r"\s+", " ", merged)
+            return (merged[:72] + "…") if len(merged) > 72 else merged
+        return default_text
+
+    def _site_teaching_hint(self, site: dict, topic: str):
+        topic_text = str(topic or "").lower()
+        site_name = str(site.get("name") or "")
+        if any(token in topic_text for token in ["函数", "图像", "导数", "极限", "参数"]):
+            if "Desmos" in site_name:
+                return "用于函数图像与参数滑块联动演示，强调变化趋势。"
+            if "GeoGebra" in site_name:
+                return "用于构造式可视化与课堂探究活动设计。"
+            if "Math3D" in site_name:
+                return "用于三维图形和曲面观察，连接平面与空间认知。"
+        if "Wolfram" in site_name:
+            return "用于补充拓展演示案例，安排课后探究任务。"
+        suggestions = site.get("suggestions") or []
+        if suggestions:
+            return f"推荐方向：{suggestions[0]}"
+        return "建议按本节关键词检索并挑选一个演示用于课堂讲解。"
+
+    def _fetch_web_title_desc(self, url: str):
+        cleaned_url = str(url or "").strip()
+        if not cleaned_url.startswith("http"):
+            return "", ""
+        try:
+            request = Request(cleaned_url, headers={"User-Agent": "Mozilla/5.0 A04-Teaching-Agent"})
+            with urlopen(request, timeout=3.5) as response:
+                payload = response.read(240000)
+            text = payload.decode("utf-8", errors="ignore")
+        except Exception:
+            return "", ""
+
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
+        desc_match = re.search(
+            r"<meta[^>]+name=[\"']description[\"'][^>]+content=[\"'](.*?)[\"']",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        title = unescape(re.sub(r"\s+", " ", title_match.group(1))).strip() if title_match else ""
+        desc = unescape(re.sub(r"\s+", " ", desc_match.group(1))).strip() if desc_match else ""
+        return title[:44], desc[:88]
+
+    def _has_interactive_intent(self, instruction_bundle: dict):
+        teacher_intent = instruction_bundle.get("teacher_intent") or {}
+        combined = " ".join(
+            [
+                str(teacher_intent.get("knowledge_points") or ""),
+                str(teacher_intent.get("style") or ""),
+                str(teacher_intent.get("revision") or ""),
+                " ".join(teacher_intent.get("creative_requests") or []),
+            ]
+        )
+        keywords = {"动画", "动效", "互动", "小游戏", "配对", "记忆", "闯关", "拖拽", "游戏", "演示", "可视化", "动态演示", "知识演示", "演示视频"}
+        return any(token in combined for token in keywords)
+
+    def _interactive_topics(self, package: dict, instruction_bundle: dict):
+        teacher_intent = instruction_bundle.get("teacher_intent") or {}
+        slots_theme = str(teacher_intent.get("course_theme") or "").strip()
+        knowledge = str(teacher_intent.get("knowledge_points") or "").strip()
+        creative_requests = [str(item).strip() for item in (teacher_intent.get("creative_requests") or []) if str(item).strip()]
+
+        slide_topics = []
+        for slide in package.get("slides") or []:
+            if str(slide.get("layout") or "") != "interactive":
+                continue
+            title = str(slide.get("title") or "互动环节").strip()
+            first_bullet = ""
+            for bullet in slide.get("bullets") or []:
+                text, _ = self._normalize_bullet_item(bullet)
+                if text:
+                    first_bullet = text
+                    break
+            composed = " / ".join([part for part in [slots_theme, knowledge, title, first_bullet] if part])
+            slide_topics.append(composed or "课堂知识演示")
+
+        if slide_topics:
+            return slide_topics
+        if creative_requests:
+            return creative_requests[:1]
+        base = " / ".join([part for part in [slots_theme, knowledge] if part]).strip()
+        return [base or "课堂知识演示"]
+
+    def _interactive_demo_type(self, instruction_bundle: dict):
+        teacher_intent = instruction_bundle.get("teacher_intent") or {}
+        combined = " ".join(
+            [
+                str(teacher_intent.get("revision") or ""),
+                " ".join(teacher_intent.get("creative_requests") or []),
+            ]
+        )
+        if any(token in combined for token in ["步骤", "过程", "推导", "时间线", "流程"]):
+            return "timeline"
+        if any(token in combined for token in ["函数", "图像", "曲线", "参数", "坐标", "变化"]):
+            return "graph"
+        return "concept"
+
+    def _safe_token(self, raw: str):
+        return hashlib.md5(str(raw).encode("utf-8")).hexdigest()[:14]
 
     def _compose_search_plan(self, session: dict, revision: str):
         slots = session["slots"]
@@ -478,6 +1064,14 @@ class ContentService:
         slots = session["slots"]
         references = self._build_reference_notes(instruction_bundle)
         creative_requests = session.get("creative_requests", [])
+        template_constraints = {
+            "max_boxes_per_slide": 7,
+            "min_boxes_per_slide": 5,
+            "main_box_max_chars": 35,
+            "side_box_max_chars": 25,
+            "note_box_max_chars": 15,
+            "total_chars_per_slide": [120, 180],
+        }
         fallback = self._fallback_package(
             slots=slots,
             references=references,
@@ -492,10 +1086,21 @@ class ContentService:
                 "请把教师意图、上传资料、本地专业知识库命中内容进行有效融合，形成完整课件。"
                 "优先保持教学逻辑完整：导入-建构-案例/练习-互动-小结。"
                 "不得堆砌检索原文，不得直接照抄资料。"
+                "【重要：模板适配约束】"
+                "请严格遵循模板文本框容量与分区语义。"
+                "默认每页按 5-7 个文本框组织内容，并区分主内容区、侧边栏、备注区。"
+                "主内容区（main）每条不超过35字；侧边栏（side）每条不超过25字；备注区（note）每条不超过15字。"
+                "每页总字数（含标题）控制在120-180字。"
+                "为保证课堂可讲性，agenda/content/case/summary 页默认输出 5-7 条要点，interactive 页输出 3-4 条（含规则/题型/反馈）。"
+                "每个核心知识点尽量给出：定义或结论 + 方法步骤 + 易错提醒/应用提示。"
+                "【内容结构要求】"
+                "slides[].bullets[] 必须是对象，格式为 {text, section_hint}。"
+                "section_hint 仅允许 main、side、note。"
+                "同一概念的多句内容必须尽量放在同一个 section_hint 中，避免拆散。"
                 "严格返回 JSON：title、theme_style、slides、closing_points、references。"
                 "slides 每项必须包含 title、layout、bullets，layout 仅可为 cover、agenda、content、case、summary、interactive。"
             ),
-            user_prompt=json.dumps({"instruction_bundle": instruction_bundle}, ensure_ascii=False),
+            user_prompt=json.dumps({"instruction_bundle": instruction_bundle, "template_constraints": template_constraints}, ensure_ascii=False),
             fallback=fallback,
         )
 
@@ -504,17 +1109,187 @@ class ContentService:
             {
                 "title": llm_result.get("title") or fallback["title"],
                 "theme_style": llm_result.get("theme_style") or fallback["theme_style"],
-                "slides": llm_result.get("slides") or fallback["slides"],
+                "slides": self._enrich_slides_density(
+                    self._normalize_slides_with_section_hints(llm_result.get("slides") or fallback["slides"]),
+                    slots=slots,
+                ),
                 "closing_points": llm_result.get("closing_points") or fallback["closing_points"],
                 "references": llm_result.get("references") or fallback["references"],
             }
         )
+        package["slides"] = self._prepare_slides_for_export_compat(package.get("slides") or [])
         package["summary"] = slots.copy()
         package["selected_template"] = instruction_bundle["teacher_intent"]["selected_template"]
+        package["template_constraints"] = template_constraints
         return package
+
+    def _normalize_slides_with_section_hints(self, slides: list[dict] | None):
+        normalized_slides = []
+        allowed_layouts = {"cover", "agenda", "content", "case", "summary", "interactive"}
+
+        for slide in slides or []:
+            layout = str(slide.get("layout") or "content").strip().lower()
+            if layout not in allowed_layouts:
+                layout = "content"
+            normalized_slide = {
+                "title": str(slide.get("title") or "未命名页面").strip() or "未命名页面",
+                "layout": layout,
+                "bullets": [],
+            }
+            for bullet in slide.get("bullets") or []:
+                text, hint = self._normalize_bullet_item(bullet)
+                if not text:
+                    continue
+                normalized_slide["bullets"].append({"text": text, "section_hint": hint})
+            normalized_slides.append(normalized_slide)
+
+        return normalized_slides
+
+    def _enrich_slides_density(self, slides: list[dict], slots: dict):
+        min_items = {
+            "cover": 3,
+            "agenda": 5,
+            "content": 6,
+            "case": 6,
+            "interactive": 4,
+            "summary": 6,
+        }
+
+        knowledge = str(slots.get("knowledge_points") or "").strip()
+        difficulties = str(slots.get("key_difficulties") or "").strip()
+
+        def _append_unique(buffer: list[dict], text: str, hint: str = "main"):
+            clean_text = re.sub(r"\s+", " ", str(text or "")).strip()
+            if not clean_text:
+                return
+            if any((item.get("text") or "") == clean_text for item in buffer):
+                return
+            buffer.append({"text": clean_text, "section_hint": hint if hint in {"main", "side", "note"} else "main"})
+
+        enriched_slides = []
+        for slide in slides or []:
+            layout = str(slide.get("layout") or "content")
+            target = min_items.get(layout, 5)
+            current = list(slide.get("bullets") or [])
+
+            # 第一层：拆分长句，增加可讲述颗粒度。
+            if len(current) < target:
+                for item in list(current):
+                    text = str(item.get("text") or "")
+                    hint = str(item.get("section_hint") or "main")
+                    segments = [re.sub(r"\s+", " ", seg).strip() for seg in re.split(r"[；;。]", text) if re.sub(r"\s+", " ", seg).strip()]
+                    for seg in segments:
+                        if len(seg) >= 6:
+                            _append_unique(current, seg, hint)
+                        if len(current) >= target:
+                            break
+                    if len(current) >= target:
+                        break
+
+            # 第二层：基于课程槽位补充“方法/误区/反馈”信息。
+            if len(current) < target:
+                layout_pool = {
+                    "agenda": [
+                        "目标：本节完成概念理解、方法掌握与应用表达",
+                        "结构：导入→概念建构→例题演练→互动反馈→小结",
+                        "检查：每部分结束后设置1个快速判断题",
+                    ],
+                    "content": [
+                        f"知识主线：{knowledge}" if knowledge else "知识主线：概念—方法—应用三段推进",
+                        f"难点提醒：{difficulties}" if difficulties else "难点提醒：建模思路与符号规范需同步把握",
+                        "方法步骤：先读条件，再建模，再计算并检验",
+                        "易错提醒：关注符号方向、区间端点和单位一致",
+                    ],
+                    "case": [
+                        "案例结构：问题→思路→解答→反思",
+                        "思路提示：先确定已知量、未知量与约束关系",
+                        "迁移提问：条件改变时结果如何调整",
+                    ],
+                    "interactive": [
+                        "规则：小组协作答题，按正确率与表达打分",
+                        "题型：概念判断 + 计算题 + 应用解释",
+                        "反馈：教师即时点评并归纳共性错误",
+                    ],
+                    "summary": [
+                        "一句话总结：从定义出发，落实到可解释的应用",
+                        "方法回顾：审题→建模→求解→验证",
+                        "下节衔接：在综合场景中提升迁移能力",
+                    ],
+                }
+                for candidate in layout_pool.get(layout, layout_pool["content"]):
+                    _append_unique(current, candidate, "main")
+                    if len(current) >= target:
+                        break
+
+            slide_copy = {
+                "title": slide.get("title") or "未命名页面",
+                "layout": layout,
+                "bullets": current[:8],
+            }
+            enriched_slides.append(slide_copy)
+
+        return enriched_slides
+
+    def _normalize_bullet_item(self, bullet) -> tuple[str, str]:
+        allowed_hints = {"main", "side", "note"}
+
+        def _clean(v):
+            return re.sub(r"\s+", " ", str(v or "")).strip()
+
+        text = ""
+        hint = "main"
+
+        if isinstance(bullet, dict):
+            text = _clean(bullet.get("text"))
+            hint = _clean(bullet.get("section_hint") or "main").lower()
+        else:
+            raw = _clean(bullet)
+            parsed = None
+            # 兼容 LLM 返回 "{'text': '...', 'section_hint': 'main'}" 这种字典字符串。
+            if raw.startswith("{") and raw.endswith("}"):
+                try:
+                    parsed = ast.literal_eval(raw)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    text = _clean(parsed.get("text"))
+                    hint = _clean(parsed.get("section_hint") or "main").lower()
+                else:
+                    text = raw
+            else:
+                text = raw
+
+        if hint not in allowed_hints:
+            hint = "main"
+        return text, hint
+
+    def _prepare_slides_for_export_compat(self, slides: list[dict]):
+        # 兼容旧版 DocumentExportService（仅支持 bullets 为字符串列表）。
+        if hasattr(self.export_service, "_bullet_text"):
+            return slides
+
+        flattened = []
+        for slide in slides or []:
+            flat_slide = {
+                "title": slide.get("title") or "未命名页面",
+                "layout": slide.get("layout") or "content",
+                "bullets": [],
+            }
+            section_hints = []
+            for bullet in slide.get("bullets") or []:
+                text, hint = self._normalize_bullet_item(bullet)
+                if not text:
+                    continue
+                flat_slide["bullets"].append(text)
+                section_hints.append(hint)
+            if section_hints:
+                flat_slide["section_hints"] = section_hints
+            flattened.append(flat_slide)
+        return flattened
 
     def _build_package_response(self, session: dict, package: dict, retrievals: list[dict], downloads: dict, instruction_bundle: dict):
         template_meta = self._template_meta(session)
+        doc_safe_package = self._sanitize_package_for_doc_export(package)
         slide_thumbnail_urls = []
         if downloads.get("pptx"):
             slide_thumbnail_urls = self.export_service.build_ppt_slide_thumbnails(downloads["pptx"])
@@ -522,7 +1297,7 @@ class ContentService:
             "package": package,
             "downloads": downloads,
             "ppt_preview": self._build_ppt_preview(package, slide_thumbnail_urls),
-            "doc_preview": self.export_service.build_doc_preview(package),
+            "doc_preview": self.export_service.build_doc_preview(doc_safe_package),
             "api_mode": "online" if self.llm_client.configured else "fallback",
             "template_suggestions": template_meta["suggestions"],
             "recommended_template": template_meta["recommended"],
@@ -543,7 +1318,7 @@ class ContentService:
         for index, slide in enumerate(package.get("slides", [])[:12]):
             bullets = []
             for bullet in (slide.get("bullets") or [])[:4]:
-                text = re.sub(r"\s+", " ", str(bullet or "")).strip()
+                text, _ = self._normalize_bullet_item(bullet)
                 bullets.append(text[:78] + ("…" if len(text) > 78 else ""))
             slides.append(
                 {
@@ -572,6 +1347,7 @@ class ContentService:
             return snapshot
 
         package = (session.get("last_package") or {}).get("package") or {}
+        doc_safe_package = self._sanitize_package_for_doc_export(package)
         downloads = (session.get("last_package") or {}).get("files") or {}
         slide_thumbnail_urls = []
         if downloads.get("pptx"):
@@ -580,7 +1356,7 @@ class ContentService:
             "package": package,
             "downloads": downloads,
             "ppt_preview": self._build_ppt_preview(package, slide_thumbnail_urls),
-            "doc_preview": self.export_service.build_doc_preview(package),
+            "doc_preview": self.export_service.build_doc_preview(doc_safe_package),
             "api_mode": "online" if self.llm_client.configured else "fallback",
             "template_suggestions": template_meta["suggestions"],
             "recommended_template": template_meta["recommended"],
@@ -703,11 +1479,53 @@ class ContentService:
         revision_note = revision or "无"
 
         slides = [
-            {"title": theme, "layout": "cover", "bullets": [f"知识点：{points}", f"课时安排：{periods}", f"版式模板：{style}"]},
-            {"title": "学习导航", "layout": "agenda", "bullets": ["情境导入", "概念建构", "例题讲解", "互动练习", "课堂小结"]},
-            {"title": "情境导入", "layout": "content", "bullets": ["用真实问题引出本课主题。", f"唤醒与“{points}”相关的前置知识。", "用一个核心问题串起整节课。"]},
-            {"title": "知识结构梳理", "layout": "content", "bullets": [f"围绕“{points}”拆分知识层级。", f"重点突破：{difficulties}。", "用板书结构或流程框帮助学生建立联系。"]},
-            {"title": "案例与练习", "layout": "case", "bullets": ["引入资料中的典型案例。", "设计基础到提升的练习链。", "提醒学生说明方法选择与易错点。"]},
+            {
+                "title": theme,
+                "layout": "cover",
+                "bullets": [
+                    {"text": f"知识点：{points}", "section_hint": "main"},
+                    {"text": f"课时安排：{periods}", "section_hint": "side"},
+                    {"text": f"版式模板：{style}", "section_hint": "note"},
+                ],
+            },
+            {
+                "title": "学习导航",
+                "layout": "agenda",
+                "bullets": [
+                    {"text": "情境导入", "section_hint": "main"},
+                    {"text": "概念建构", "section_hint": "main"},
+                    {"text": "例题讲解", "section_hint": "side"},
+                    {"text": "互动练习", "section_hint": "side"},
+                    {"text": "课堂小结", "section_hint": "note"},
+                ],
+            },
+            {
+                "title": "情境导入",
+                "layout": "content",
+                "bullets": [
+                    {"text": "用真实问题引出本课主题。", "section_hint": "main"},
+                    {"text": f"唤醒与“{points}”相关的前置知识。", "section_hint": "main"},
+                    {"text": "用一个核心问题串起整节课。", "section_hint": "side"},
+                ],
+            },
+            {
+                "title": "知识结构梳理",
+                "layout": "content",
+                "bullets": [
+                    {"text": f"围绕“{points}”拆分知识层级。", "section_hint": "main"},
+                    {"text": f"重点突破：{difficulties}。", "section_hint": "note"},
+                    {"text": "用板书结构或流程框帮助学生建立联系。", "section_hint": "side"},
+                ],
+            },
+            {
+                "title": "案例与练习",
+                "layout": "case",
+                "bullets": [
+                    {"text": "引入资料中的典型案例。", "section_hint": "main"},
+                    {"text": "设计基础到提升的练习链。", "section_hint": "side"},
+                    {"text": "提醒学生说明方法选择与易错点。", "section_hint": "note"},
+                ],
+            },
         ]
         if creative_requests:
             slides.append(
@@ -715,13 +1533,23 @@ class ContentService:
                     "title": "互动创意设计",
                     "layout": "interactive",
                     "bullets": [
-                        "知识点动画创意：用逐步显现、遮罩揭示或移动路径突出概念变化。",
-                        "互动小游戏：设计配对、闯关、拖拽排序或抢答环节，服务于知识点掌握。",
-                        f"教师附加要求：{'；'.join(creative_requests[:3])}",
+                        {"text": "知识点动画创意：用逐步显现、遮罩揭示或移动路径突出概念变化。", "section_hint": "main"},
+                        {"text": "互动小游戏：设计配对、闯关、拖拽排序或抢答环节，服务于知识点掌握。", "section_hint": "side"},
+                        {"text": f"教师附加要求：{'；'.join(creative_requests[:3])}", "section_hint": "note"},
                     ],
                 }
             )
-        slides.append({"title": "课堂小结", "layout": "summary", "bullets": ["回顾本节课的核心概念、方法与误区。", "用出口任务检查达成度。", f"本次修改要求：{revision_note}"]})
+        slides.append(
+            {
+                "title": "课堂小结",
+                "layout": "summary",
+                "bullets": [
+                    {"text": "回顾本节课的核心概念、方法与误区。", "section_hint": "main"},
+                    {"text": "用出口任务检查达成度。", "section_hint": "side"},
+                    {"text": f"本次修改要求：{revision_note}", "section_hint": "note"},
+                ],
+            }
+        )
         return {
             "title": f"{theme} 互动式教学课件",
             "theme_style": style,

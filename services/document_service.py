@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
 import re
+import ast
 import hashlib
 import subprocess
 import shutil
@@ -25,6 +26,8 @@ class DocumentExportService:
     TARGET_SLIDE_HEIGHT = Inches(7.5)
     TEMPLATE_MIN_BODY_LINES = 2
     TEMPLATE_MIN_CHAR_CAPACITY = 80
+    TEMPLATE_MAX_ROTATED_TEXT_SHAPES = 1
+    TEMPLATE_MAX_NARROW_TALL_TEXT_SHAPES = 2
     PLACEHOLDER_HINTS = (
         "add a main point",
         "briefly elaborate",
@@ -125,7 +128,7 @@ class DocumentExportService:
     def _build_ppt(self, file_path: Path, package: dict):
         style_signal = package.get("selected_template") or package.get("theme_style") or package.get("summary", {}).get("style") or "教育蓝"
         self._apply_theme(style_signal)
-        slides = self._normalize_slides_for_ppt(package.get("slides", []))
+        slides = self._normalize_slides_for_ppt(package.get("slides", []), package.get("summary") or {})
         template_name = str(package.get("selected_template") or "").strip()
         template_path = self.external_templates.get(template_name)
 
@@ -175,13 +178,51 @@ class DocumentExportService:
 
         for index, slide_data in enumerate(slides):
             text_lines = self._build_template_text_lines(slide_data, package, index=index, total=len(slides))
-            if not self._template_slide_has_enough_capacity(prs.slides[index], text_lines):
+            if not self._template_slide_is_stable_for_content(prs.slides[index], text_lines):
                 return False
             self._fill_template_slide_text(prs.slides[index], text_lines)
 
         for index in range(len(prs.slides) - 1, len(slides) - 1, -1):
             self._remove_slide_at(prs, index)
 
+        return True
+
+    def _template_slide_is_stable_for_content(self, slide, text_lines: list[str]) -> bool:
+        if not self._template_slide_has_enough_capacity(slide, text_lines):
+            return False
+
+        rotated_count = 0
+        narrow_tall_count = 0
+        text_shape_count = 0
+        for shape in slide.shapes:
+            if not getattr(shape, "has_text_frame", False):
+                continue
+            width = int(getattr(shape, "width", 0) or 0)
+            height = int(getattr(shape, "height", 0) or 0)
+            if width <= 0 or height <= 0:
+                continue
+            text_shape_count += 1
+
+            width_in = float(width) / 914400.0
+            height_in = float(height) / 914400.0
+            if width_in <= 1.2 and height_in >= 2.4:
+                narrow_tall_count += 1
+
+            rotation = float(getattr(shape, "rotation", 0) or 0)
+            normalized_rotation = abs(rotation) % 360
+            if normalized_rotation > 1.0 and abs(normalized_rotation - 360.0) > 1.0:
+                rotated_count += 1
+
+        if text_shape_count <= 0:
+            return False
+        if rotated_count > self.TEMPLATE_MAX_ROTATED_TEXT_SHAPES:
+            return False
+
+        title_shape, body_shapes = self._collect_text_shapes(slide)
+        if not title_shape and not body_shapes:
+            return False
+        if narrow_tall_count > self.TEMPLATE_MAX_NARROW_TALL_TEXT_SHAPES and len(body_shapes) < 2:
+            return False
         return True
 
     def _template_slide_has_enough_capacity(self, slide, text_lines: list[str]) -> bool:
@@ -484,24 +525,38 @@ class DocumentExportService:
         prs.part.drop_rel(rel_id)
         prs.slides._sldIdLst.remove(slide_id)
 
-    def _normalize_slides_for_ppt(self, slides: list[dict]):
+    def _normalize_slides_for_ppt(self, slides: list[dict], summary: dict | None = None):
         max_bullets = {
             "cover": 4,
-            "agenda": 6,
-            "content": 5,
+            "agenda": 7,
+            "content": 6,
             "case": 6,
-            "interactive": 3,
-            "summary": 6,
+            "interactive": 4,
+            "summary": 7,
         }
+        summary = summary or {}
         normalized = []
         for slide in slides or []:
             layout = str(slide.get("layout") or "content")
             limit = max_bullets.get(layout, 5)
             bullets = []
             for index, raw in enumerate((slide.get("bullets") or [])[:limit]):
-                clean = self._compact_text(raw, max_len=44 if index == 0 else 54)
+                clean = self._compact_text(self._bullet_text(raw), max_len=44 if index == 0 else 54)
                 if clean:
                     bullets.append(clean)
+            if layout in {"content", "case", "summary"}:
+                support = [
+                    self._compact_text(f"知识点：{summary.get('knowledge_points', '')}", max_len=54),
+                    self._compact_text(f"重难点：{summary.get('key_difficulties', '')}", max_len=54),
+                    "方法提示：审题→建模→求解→检验",
+                    "易错提醒：关注符号、区间与单位",
+                ]
+                bullets = self._expand_content_lines([*bullets, *[s for s in support if s and not s.endswith("：")]], min_count=min(6, limit), max_count=limit)
+            elif layout == "agenda":
+                bullets = self._expand_content_lines(bullets, min_count=min(5, limit), max_count=limit)
+            elif layout == "interactive":
+                support = ["规则：分组抢答，限时作答", "题型：概念判断+计算+应用", "反馈：讲评共性错误"]
+                bullets = self._expand_content_lines([*bullets, *support], min_count=min(4, limit), max_count=limit)
             normalized.append(
                 {
                     "title": self._compact_text(slide.get("title") or "未命名页面", max_len=30),
@@ -510,6 +565,19 @@ class DocumentExportService:
                 }
             )
         return normalized
+
+    def _bullet_text(self, bullet) -> str:
+        if isinstance(bullet, dict):
+            return self._bullet_text(bullet.get("text"))
+        raw = str(bullet or "").strip()
+        if raw.startswith("{") and raw.endswith("}"):
+            try:
+                parsed = ast.literal_eval(raw)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                return self._bullet_text(parsed.get("text"))
+        return self._compact_text(bullet, max_len=80)
 
     def _compact_text(self, value, max_len: int = 54):
         text = re.sub(r"\s+", " ", str(value or "")).strip()
@@ -765,6 +833,18 @@ class DocumentExportService:
         p.font.color.rgb = RGBColor(*color)
         return box
 
+    def _format_body_paragraph(self, paragraph, size_pt: float, *, bold: bool = False, color: tuple | None = None):
+        paragraph.level = 0
+        paragraph.alignment = PP_ALIGN.LEFT
+        paragraph.line_spacing = 1.15
+        paragraph.space_before = PptPt(0)
+        paragraph.space_after = PptPt(3)
+        paragraph.font.size = PptPt(size_pt)
+        paragraph.font.bold = bold
+        paragraph.font.name = "Microsoft YaHei"
+        if color is not None:
+            paragraph.font.color.rgb = RGBColor(*color)
+
     def _add_top_band(self, slide):
         band = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(0.2))
         band.fill.solid()
@@ -823,9 +903,7 @@ class DocumentExportService:
         for idx, item in enumerate(items):
             p = info.text_frame.paragraphs[0] if idx == 0 else info.text_frame.add_paragraph()
             p.text = item
-            p.font.size = PptPt(17)
-            p.font.name = "Microsoft YaHei"
-            p.font.color.rgb = RGBColor(*title_color)
+            self._format_body_paragraph(p, size_pt=17, color=title_color)
 
     def _add_agenda_slide(self, prs: Presentation, slide_data: dict):
         slide = self._add_blank_slide(prs)
@@ -852,11 +930,8 @@ class DocumentExportService:
             card.line.color.rgb = RGBColor(*self.theme["accent"])
             card.text_frame.word_wrap = True
             p = card.text_frame.paragraphs[0]
-            p.text = f"{index + 1:02d}  {bullet}"
-            p.font.size = PptPt(18 if card_h < 1.2 else 16)
-            p.font.bold = True
-            p.font.name = "Microsoft YaHei"
-            p.font.color.rgb = RGBColor(*self.theme["dark_text"])
+            p.text = f"{index + 1:02d}  {self._bullet_text(bullet)}"
+            self._format_body_paragraph(p, size_pt=(18 if card_h < 1.2 else 16), bold=True, color=self.theme["dark_text"])
 
     def _add_content_slide(self, prs: Presentation, slide_data: dict):
         slide = self._add_blank_slide(prs)
@@ -880,11 +955,8 @@ class DocumentExportService:
                 frame.word_wrap = True
                 for idx, bullet in enumerate(bullets):
                     p = frame.paragraphs[0] if idx == 0 else frame.add_paragraph()
-                    p.text = bullet
-                    p.font.size = PptPt(20 if idx == 0 else 17)
-                    p.font.bold = idx == 0
-                    p.font.name = "Microsoft YaHei"
-                    p.font.color.rgb = RGBColor(*self.theme["dark_text"])
+                    p.text = self._bullet_text(bullet)
+                    self._format_body_paragraph(p, size_pt=(20 if idx == 0 else 17), bold=(idx == 0), color=self.theme["dark_text"])
         elif family in {"playful", "airy"}:
             banner = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(0.9), Inches(1.5), Inches(11.55), Inches(4.8))
             banner.fill.solid()
@@ -892,11 +964,8 @@ class DocumentExportService:
             banner.line.color.rgb = RGBColor(*self.theme["accent"])
             for idx, bullet in enumerate(slide_data.get("bullets", [])[:5]):
                 p = banner.text_frame.paragraphs[0] if idx == 0 else banner.text_frame.add_paragraph()
-                p.text = bullet
-                p.font.size = PptPt(21 if idx == 0 else 18)
-                p.font.bold = idx == 0
-                p.font.name = "Microsoft YaHei"
-                p.font.color.rgb = RGBColor(*self.theme["dark_text"])
+                p.text = self._bullet_text(bullet)
+                self._format_body_paragraph(p, size_pt=(21 if idx == 0 else 18), bold=(idx == 0), color=self.theme["dark_text"])
         else:
             side = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.RECTANGLE, Inches(0.7), Inches(1.45), Inches(0.22), Inches(5.2))
             side.fill.solid()
@@ -909,11 +978,8 @@ class DocumentExportService:
             content.text_frame.word_wrap = True
             for idx, bullet in enumerate(slide_data.get("bullets", [])[:5]):
                 p = content.text_frame.paragraphs[0] if idx == 0 else content.text_frame.add_paragraph()
-                p.text = bullet
-                p.font.size = PptPt(22 if idx == 0 else 18)
-                p.font.bold = idx == 0
-                p.font.name = "Microsoft YaHei"
-                p.font.color.rgb = RGBColor(*self.theme["dark_text"])
+                p.text = self._bullet_text(bullet)
+                self._format_body_paragraph(p, size_pt=(22 if idx == 0 else 18), bold=(idx == 0), color=self.theme["dark_text"])
 
     def _add_case_slide(self, prs: Presentation, slide_data: dict):
         slide = self._add_blank_slide(prs)
@@ -934,10 +1000,8 @@ class DocumentExportService:
         head.font.color.rgb = RGBColor(*self.theme["dark_text"])
         for bullet in slide_data.get("bullets", [])[:2]:
             p = left.text_frame.add_paragraph()
-            p.text = bullet
-            p.font.size = PptPt(17)
-            p.font.name = "Microsoft YaHei"
-            p.font.color.rgb = RGBColor(*self.theme["dark_text"])
+            p.text = self._bullet_text(bullet)
+            self._format_body_paragraph(p, size_pt=17, color=self.theme["dark_text"])
 
         right = slide.shapes.add_shape(MSO_AUTO_SHAPE_TYPE.ROUNDED_RECTANGLE, Inches(5.0), Inches(1.65), Inches(7.35), Inches(4.95))
         right.fill.solid()
@@ -946,10 +1010,8 @@ class DocumentExportService:
         right.text_frame.word_wrap = True
         for idx, bullet in enumerate(slide_data.get("bullets", [])[2:6]):
             p = right.text_frame.paragraphs[0] if idx == 0 else right.text_frame.add_paragraph()
-            p.text = bullet
-            p.font.size = PptPt(18)
-            p.font.name = "Microsoft YaHei"
-            p.font.color.rgb = RGBColor(*self.theme["dark_text"])
+            p.text = self._bullet_text(bullet)
+            self._format_body_paragraph(p, size_pt=18, color=self.theme["dark_text"])
 
     def _add_interactive_slide(self, prs: Presentation, slide_data: dict):
         slide = self._add_blank_slide(prs)
@@ -965,15 +1027,10 @@ class DocumentExportService:
             card.line.color.rgb = RGBColor(*self.theme["accent"])
             badge = card.text_frame.paragraphs[0]
             badge.text = f"互动 {idx + 1}"
-            badge.font.size = PptPt(18)
-            badge.font.bold = True
-            badge.font.name = "Microsoft YaHei"
-            badge.font.color.rgb = RGBColor(*self.theme["accent"])
+            self._format_body_paragraph(badge, size_pt=18, bold=True, color=self.theme["accent"])
             body = card.text_frame.add_paragraph()
-            body.text = bullet
-            body.font.size = PptPt(16)
-            body.font.name = "Microsoft YaHei"
-            body.font.color.rgb = RGBColor(*self.theme["dark_text"])
+            body.text = self._bullet_text(bullet)
+            self._format_body_paragraph(body, size_pt=16, color=self.theme["dark_text"])
 
     def _add_summary_slide(self, prs: Presentation, slide_data: dict, package: dict):
         slide = self._add_blank_slide(prs)
@@ -986,16 +1043,19 @@ class DocumentExportService:
         box.fill.fore_color.rgb = RGBColor(*self.theme["card"])
         box.line.fill.background()
 
+        frame = box.text_frame
+        frame.clear()
+        frame.word_wrap = True
+
         items = []
         for item in slide_data.get("bullets", []) + package.get("closing_points", []):
-            if item not in items:
-                items.append(item)
-        for idx, bullet in enumerate(items[:6]):
-            p = box.text_frame.paragraphs[0] if idx == 0 else box.text_frame.add_paragraph()
-            p.text = bullet
-            p.font.size = PptPt(19)
-            p.font.name = "Microsoft YaHei"
-            p.font.color.rgb = RGBColor(*self.theme["dark_text"])
+            clean_item = self._bullet_text(item)
+            if clean_item and clean_item not in items:
+                items.append(clean_item)
+        for idx, bullet in enumerate(items[:7]):
+            p = frame.paragraphs[0] if idx == 0 else frame.add_paragraph()
+            p.text = self._bullet_text(bullet)
+            self._format_body_paragraph(p, size_pt=19, color=self.theme["dark_text"])
 
     def _write_kv(self, document: Document, label: str, value: str):
         paragraph = document.add_paragraph()

@@ -20,6 +20,20 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 
+const REQUIRED_SLOT_COUNT = 5;
+
+function getFilledSlotCount(slots) {
+  return Object.values(slots || {}).filter((value) => String(value || "").trim()).length;
+}
+
+function isSlotReady() {
+  return getFilledSlotCount(state.slots) >= REQUIRED_SLOT_COUNT;
+}
+
+function isGeneratingBusy() {
+  return Boolean(state.isGeneratingPpt || state.isGeneratingDoc);
+}
+
 async function requestJSON(url, options = {}) {
   const response = await fetch(url, options);
   const raw = await response.text();
@@ -44,7 +58,7 @@ function switchView(view) {
 
 function updateDemandProgress(slots) {
   const values = Object.values(slots || {});
-  const filled = values.filter((value) => String(value || "").trim()).length;
+  const filled = getFilledSlotCount(slots || {});
   $("#sessionIdText").textContent = `${Math.round((filled / Math.max(values.length, 1)) * 100)}%`;
 }
 
@@ -330,7 +344,7 @@ function hydrateTemplateMeta(data) {
 function renderTemplateSelector() {
   const toggleBtn = $("#toggleTemplatePickerBtn");
   const selectedText = $("#selectedTemplateText");
-  const enabled = Object.values(state.slots || {}).filter((value) => String(value || "").trim()).length >= 5;
+  const enabled = isSlotReady();
   if (toggleBtn) {
     toggleBtn.disabled = !enabled;
     toggleBtn.textContent = enabled ? "选择模板" : "补全需求后可选模板";
@@ -398,12 +412,52 @@ function updateButtonStates() {
   const pptBtn = $("#generatePptBtn");
   const docBtn = $("#generateDocBtn");
   const reviseBtn = $("#reviseBtn");
+  const sendBtn = $("#sendBtn");
+  const attachBtn = $("#attachBtn");
+  const voiceBtn = $("#voiceInputBtn");
+  const chatInput = $("#chatInput");
+  const fileInput = $("#fileInput");
+  const guardHint = $("#generationGuardHint");
+  const pptLoadingBar = $("#pptLoadingBar");
+  const composer = document.querySelector(".composer-shell");
   if (!pptBtn || !docBtn || !reviseBtn) return;
-  pptBtn.disabled = state.generationLocked || state.isGeneratingPpt || state.isGeneratingDoc || state.isRevising;
-  docBtn.disabled = state.generationLocked || state.isGeneratingPpt || state.isGeneratingDoc || state.isRevising;
+  const slotReady = isSlotReady();
+  const generatingBusy = isGeneratingBusy();
+  const actionBusy = generatingBusy || state.isRevising;
+
+  pptBtn.disabled = !slotReady || actionBusy;
+  docBtn.disabled = !slotReady || actionBusy;
   reviseBtn.disabled = !state.generationLocked || state.isGeneratingPpt || state.isGeneratingDoc || state.isRevising;
-  pptBtn.textContent = state.isGeneratingPpt ? "生成中" : (state.generationLocked ? "已生成" : "生成 PPT");
-  docBtn.textContent = state.isGeneratingDoc ? "生成中" : (state.generationLocked ? "已生成" : "生成教案");
+
+  if (sendBtn) sendBtn.disabled = actionBusy;
+  if (attachBtn) attachBtn.disabled = actionBusy;
+  if (voiceBtn) voiceBtn.disabled = actionBusy;
+  if (chatInput) chatInput.disabled = actionBusy;
+  if (fileInput) fileInput.disabled = actionBusy;
+
+  if (composer) composer.classList.toggle("locked", actionBusy);
+
+  if (guardHint) {
+    guardHint.classList.remove("warn", "locked");
+    if (generatingBusy) {
+      guardHint.textContent = "正在生成文件：暂时不能继续对话、上传或发起另一个生成。";
+      guardHint.classList.add("locked");
+    } else if (!slotReady) {
+      guardHint.textContent = "请先补全课程主题、知识点、重难点、课时安排、课件风格后再生成。";
+      guardHint.classList.add("warn");
+    } else {
+      guardHint.textContent = "信息已补全，可生成 PPT 或教案。";
+    }
+  }
+
+  if (pptLoadingBar) {
+    const active = Boolean(state.isGeneratingPpt);
+    pptLoadingBar.classList.toggle("active", active);
+    pptLoadingBar.setAttribute("aria-hidden", active ? "false" : "true");
+  }
+
+  pptBtn.textContent = state.isGeneratingPpt ? "生成中" : "生成 PPT";
+  docBtn.textContent = state.isGeneratingDoc ? "生成中" : "生成教案";
   reviseBtn.textContent = state.isRevising ? "优化中" : "根据意见重新优化";
   renderTemplateSelector();
 }
@@ -483,6 +537,10 @@ async function createSession() {
 
 async function sendMessage() {
   if (!state.sessionId) await createSession();
+  if (isGeneratingBusy()) {
+    alert("正在生成文件，请稍候再继续对话。");
+    return;
+  }
   const message = $("#chatInput").value.trim();
   if (!message) return;
   appendChat("user", message);
@@ -506,6 +564,10 @@ async function sendMessage() {
 
 async function uploadFiles() {
   if (!state.sessionId) await createSession();
+  if (isGeneratingBusy()) {
+    alert("正在生成文件，暂时不能上传资料。");
+    return;
+  }
   const files = $("#fileInput").files;
   if (!files || !files.length) return;
   const formData = new FormData();
@@ -579,7 +641,11 @@ function setupVoiceInput() {
 
 async function generatePpt() {
   if (!state.sessionId) await createSession();
-  if (state.isGeneratingPpt || state.generationLocked) return;
+  if (!isSlotReady()) {
+    alert("请先补全课程主题、知识点、重难点、课时安排、课件风格后再生成。")
+    return;
+  }
+  if (state.isGeneratingPpt || state.isGeneratingDoc || state.isRevising) return;
   state.isGeneratingPpt = true;
   updateButtonStates();
   $("#sessionState").textContent = "正在生成 PPT...";
@@ -602,7 +668,11 @@ async function generatePpt() {
 
 async function generateDoc() {
   if (!state.sessionId) await createSession();
-  if (state.isGeneratingDoc || state.generationLocked) return;
+  if (!isSlotReady()) {
+    alert("请先补全课程主题、知识点、重难点、课时安排、课件风格后再生成。")
+    return;
+  }
+  if (state.isGeneratingDoc || state.isGeneratingPpt || state.isRevising) return;
   state.isGeneratingDoc = true;
   updateButtonStates();
   $("#sessionState").textContent = "正在生成教案...";
@@ -657,7 +727,7 @@ function handleError(error) {
 
 function bootstrapTemplateModal() {
   $("#toggleTemplatePickerBtn")?.addEventListener("click", () => {
-    if (Object.values(state.slots || {}).filter((value) => String(value || "").trim()).length < 5) return;
+    if (!isSlotReady()) return;
     openTemplatePicker();
   });
   $("#closeTemplatePickerBtn")?.addEventListener("click", () => closeTemplatePicker());
@@ -700,8 +770,9 @@ function bindEvents() {
       return;
     }
     if (action === "focus-revision") {
-      $("#revisionInput")?.scrollIntoView({ behavior: "smooth", block: "center" });
-      $("#revisionInput")?.focus();
+      switchView("result");
+      $("#revisionFloatingPanel")?.scrollIntoView({ behavior: "smooth", block: "end" });
+      window.setTimeout(() => $("#revisionInput")?.focus(), 180);
       return;
     }
     if (action === "new-session") {

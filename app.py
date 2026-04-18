@@ -11,7 +11,7 @@ from services.content_service import ContentService
 from services.file_parser import FileParserService
 from services.llm_client import OnlineLLMClient
 from services.rag_service import LocalRAGService
-from services.session_manager import SessionManager
+from services.session_manager import SessionManager, REQUIRED_FIELDS
 
 load_dotenv()
 
@@ -41,6 +41,20 @@ rag_service = LocalRAGService(vector_dir=VECTOR_DIR)
 audio_transcriber = OfflineAudioTranscriber(workspace_dir=UPLOAD_DIR, model_path=os.getenv("VOSK_MODEL_PATH", ""))
 file_parser = FileParserService(upload_dir=UPLOAD_DIR, llm_client=llm_client, audio_transcriber=audio_transcriber)
 content_service = ContentService(llm_client=llm_client, rag_service=rag_service, output_dir=OUTPUT_DIR)
+
+
+def _missing_required_slots(session: dict) -> list[dict]:
+    slots = session.get("slots") or {}
+    missing = []
+    for key, label in REQUIRED_FIELDS.items():
+        if not str(slots.get(key) or "").strip():
+            missing.append({"key": key, "label": label})
+    return missing
+
+
+def _is_generating(session: dict) -> bool:
+    state = session.get("state") or {}
+    return bool(state.get("generating_ppt") or state.get("generating_doc"))
 
 
 def _bootstrap_builtin_rag():
@@ -154,6 +168,8 @@ def chat():
     session = session_manager.get_session(session_id)
     if session is None:
         return jsonify({"error": "会话不存在，请刷新页面后重试"}), 404
+    if _is_generating(session):
+        return jsonify({"error": "正在生成文件，请稍候再继续对话。"}), 409
     result = content_service.handle_chat(session_id=session_id, session=session, user_message=message)
     session_manager.touch_session(session_id)
     return jsonify(result)
@@ -167,6 +183,8 @@ def upload_files():
     session = session_manager.get_session(session_id)
     if session is None:
         return jsonify({"error": "会话不存在，请刷新页面后重试"}), 404
+    if _is_generating(session):
+        return jsonify({"error": "正在生成文件，暂时不能上传资料。"}), 409
 
     files = request.files.getlist("files")
     if not files:
@@ -212,15 +230,20 @@ def generate_ppt():
         return jsonify({"error": "会话不存在，请刷新页面后重试"}), 404
 
     state = session["state"]
+    missing = _missing_required_slots(session)
+    if missing:
+        labels = "、".join(item["label"] for item in missing)
+        return jsonify({"error": f"请先补全关键信息后再生成：{labels}", "missing_fields": missing}), 400
     if state["generating_ppt"]:
         return jsonify({"error": "PPT 正在生成中，请勿重复点击。"}), 409
-    if state["generation_locked"]:
-        return jsonify({"error": "本会话已生成过课件。如需重新生成，请开启新会话或使用“根据意见重新优化”。"}), 409
+    if state["generating_doc"]:
+        return jsonify({"error": "教案正在生成中，请稍后再生成 PPT。"}), 409
+    if state["revising"]:
+        return jsonify({"error": "正在根据意见优化，请稍后再试。"}), 409
 
     state["generating_ppt"] = True
     try:
         result = content_service.generate_ppt(session_id=session_id, session=session, selected_template=selected_template)
-        state["generation_locked"] = True
         session_manager.touch_session(session_id)
         return jsonify(result)
     finally:
@@ -239,15 +262,20 @@ def generate_docx():
         return jsonify({"error": "会话不存在，请刷新页面后重试"}), 404
 
     state = session["state"]
+    missing = _missing_required_slots(session)
+    if missing:
+        labels = "、".join(item["label"] for item in missing)
+        return jsonify({"error": f"请先补全关键信息后再生成：{labels}", "missing_fields": missing}), 400
     if state["generating_doc"]:
         return jsonify({"error": "教案正在生成中，请勿重复点击。"}), 409
-    if state["generation_locked"]:
-        return jsonify({"error": "本会话已生成过文件。如需重新生成，请开启新会话或使用“根据意见重新优化”。"}), 409
+    if state["generating_ppt"]:
+        return jsonify({"error": "PPT 正在生成中，请稍后再生成教案。"}), 409
+    if state["revising"]:
+        return jsonify({"error": "正在根据意见优化，请稍后再试。"}), 409
 
     state["generating_doc"] = True
     try:
         result = content_service.generate_doc(session_id=session_id, session=session, selected_template=selected_template)
-        state["generation_locked"] = True
         session_manager.touch_session(session_id)
         return jsonify(result)
     finally:
@@ -269,6 +297,8 @@ def revise():
         return jsonify({"error": "会话不存在，请刷新页面后重试"}), 404
 
     state = session["state"]
+    if _is_generating(session):
+        return jsonify({"error": "正在生成文件，请稍后再提交优化意见。"}), 409
     if state["revising"]:
         return jsonify({"error": "正在根据修改意见优化，请勿重复提交。"}), 409
 
