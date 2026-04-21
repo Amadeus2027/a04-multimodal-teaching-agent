@@ -13,7 +13,7 @@
   <div class="app-shell">
     <aside class="history-sidebar">
       <div class="sidebar-head">
-        <div class="brand">A04 Teaching Agent</div>
+        <div class="brand">数智备课助手</div>
         <button id="sidebarNewChatBtn" class="btn btn-primary">+ 新对话</button>
       </div>
       <div class="sidebar-section-title">历史会话</div>
@@ -24,7 +24,7 @@
       <header class="workspace-topbar">
         <div>
           <h1>多模态教学智能体</h1>
-          <p class="sub">ChatGPT 风格交互 · 高数备课场景</p>
+          <p class="sub">AI 对话式备课 · 高数教学场景</p>
         </div>
         <div class="status-metrics">
           <article><span>状态</span><strong id="sessionState">未初始化</strong></article>
@@ -53,7 +53,7 @@
                     <div class="ppt-loading-track">
                       <div class="ppt-loading-fill"></div>
                     </div>
-                    <div class="ppt-loading-text">PPT 正在生成，请稍候…</div>
+                    <div class="ppt-loading-text"><span>准备中...</span><span>0%</span></div>
                   </div>
                 </div>
                 <div class="composer-generate">
@@ -74,6 +74,9 @@
             <h3>已上传资料</h3>
             <div class="meta">通过输入框左侧回形针上传（与对话融合）</div>
             <div id="uploadResults" class="info-list empty">还没有上传任何资料（建议优先上传高数相关内容）。</div>
+            <div id="backToResultWrap" class="back-to-result-wrap hidden">
+              <button id="backToResultBtn" class="btn btn-light">查看生成结果</button>
+            </div>
           </div>
         </div>
       </section>

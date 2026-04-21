@@ -318,6 +318,19 @@ def revise():
         state["revising"] = False
 
 
+@app.get("/api/progress/<session_id>")
+def get_progress(session_id: str):
+    session = session_manager.get_session(session_id)
+    if session is None:
+        return jsonify({"error": "会话不存在"}), 404
+    state = session.get("state") or {}
+    return jsonify({
+        "percent": state.get("progress_percent", 0),
+        "label": state.get("progress_label", ""),
+        "generating": bool(state.get("generating_ppt") or state.get("generating_doc") or state.get("revising")),
+    })
+
+
 @app.get("/api/download/<path:filename>")
 def download_file(filename: str):
     return send_from_directory(OUTPUT_DIR, Path(filename).name, as_attachment=True)

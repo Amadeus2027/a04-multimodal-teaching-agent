@@ -14,10 +14,11 @@ import os
 from html import unescape
 from urllib.parse import quote, quote_plus, urljoin, urlparse, parse_qs, unquote
 from urllib.request import Request, urlopen
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE
-from pptx.util import Inches
+from pptx.util import Inches, Pt
 
 from services.document_service import DocumentExportService
 from services.interactive_service import InteractiveService
@@ -51,6 +52,7 @@ class ContentService:
             "avoid_hints": ["/search", "login", "signup", "privacy", "terms"],
             "default_summary": "覆盖函数图像、几何构造与课堂活动，适合做概念可视化与探究任务。",
             "suggestions": ["函数图像动态演示", "参数变化观察", "课堂互动活动"],
+            "brief_intro": "开源动态数学软件，支持函数绘图、几何作图与代数运算，可创建交互式课堂活动，适合概念可视化与探究式教学。",
         },
         {
             "name": "Desmos Calculator",
@@ -66,6 +68,7 @@ class ContentService:
             "avoid_hints": ["/search", "login", "signup", "privacy", "terms"],
             "default_summary": "图形计算器响应快，适合展示函数、极限邻域变化与参数联动。",
             "suggestions": ["函数与导数图像", "极限邻域放大", "参数滑块演示"],
+            "brief_intro": "在线图形计算器，支持函数、参数方程与数据可视化，响应迅速，适合课堂实时演示函数变化与极限邻域。",
         },
         {
             "name": "Math3D",
@@ -80,6 +83,7 @@ class ContentService:
             "avoid_hints": ["/search", "login", "signup", "privacy", "terms"],
             "default_summary": "面向三维函数与曲面演示，可用于空间几何与多元函数直观讲解。",
             "suggestions": ["三维曲面观察", "截面变化", "空间参数影响"],
+            "brief_intro": "在线三维数学可视化工具，支持曲面、空间曲线与向量场演示，适合多元函数与空间几何直观讲解。",
         },
         {
             "name": "Wolfram Demonstrations",
@@ -95,6 +99,7 @@ class ContentService:
             "avoid_hints": ["/search", "login", "signup", "privacy", "terms"],
             "default_summary": "汇集大量数学与科学交互演示，适合做拓展案例与课后探索。",
             "suggestions": ["可视化案例拓展", "跨学科演示", "探究式作业素材"],
+            "brief_intro": "Wolfram 演示项目收录大量交互式数学与科学演示，涵盖微积分、线性代数等领域，适合拓展案例与课后探究。",
         },
     ]
 
@@ -159,6 +164,11 @@ class ContentService:
         self.template_profiles = list(dedup.values())
         self.template_names = [item["name"] for item in self.template_profiles]
         self.template_scenes = {item["name"]: item["scene"] for item in self.template_profiles}
+
+    def _update_progress(self, session: dict, percent: int, label: str):
+        state = session.get("state") or {}
+        state["progress_percent"] = max(0, min(100, int(percent)))
+        state["progress_label"] = str(label or "").strip()
 
     def _load_external_template_profiles(self, template_dir: Path):
         if not template_dir.exists():
@@ -418,6 +428,7 @@ class ContentService:
         }
 
     def generate_ppt(self, session_id: str, session: dict, selected_template: str = ""):
+        self._update_progress(session, 5, "正在检索知识库...")
         package, retrievals, instruction_bundle = self._generate_package_core(
             session_id,
             session,
@@ -425,11 +436,15 @@ class ContentService:
             selected_template=selected_template,
             include_interactive_media=True,
         )
+        self._update_progress(session, 85, "正在导出 PPTX...")
         exported = self.export_service.build_ppt(package)
+        self._update_progress(session, 95, "正在生成预览...")
         session["last_package"] = {"package": package, "files": exported}
+        self._update_progress(session, 100, "生成完成")
         return self._build_package_response(session, package, retrievals, exported, instruction_bundle)
 
     def generate_doc(self, session_id: str, session: dict, selected_template: str = ""):
+        self._update_progress(session, 5, "正在检索知识库...")
         package, retrievals, instruction_bundle = self._generate_package_core(
             session_id,
             session,
@@ -437,13 +452,16 @@ class ContentService:
             selected_template=selected_template,
             include_interactive_media=False,
         )
+        self._update_progress(session, 85, "正在导出 DOCX...")
         doc_safe_package = self._sanitize_package_for_doc_export(package)
         exported = self.export_service.build_doc(doc_safe_package)
         session["last_package"] = {"package": package, "files": exported}
+        self._update_progress(session, 100, "生成完成")
         return self._build_package_response(session, package, retrievals, exported, instruction_bundle)
 
     def revise_teaching_package(self, session_id: str, session: dict, revision: str, selected_template: str = ""):
         self._collect_creative_requests(session, revision)
+        self._update_progress(session, 5, "正在根据意见优化...")
         package, retrievals, instruction_bundle = self._generate_package_core(
             session_id,
             session,
@@ -452,11 +470,13 @@ class ContentService:
             include_interactive_media=True,
         )
         package["applied_revision"] = revision
+        self._update_progress(session, 80, "正在导出文件...")
         doc_safe_package = self._sanitize_package_for_doc_export(package)
         exported = {}
         exported.update(self.export_service.build_ppt(package))
         exported.update(self.export_service.build_doc(doc_safe_package))
         session["last_package"] = {"package": package, "files": exported}
+        self._update_progress(session, 100, "优化完成")
         response = self._build_package_response(session, package, retrievals, exported, instruction_bundle)
         response["revision_applied"] = revision
         return response
@@ -525,7 +545,11 @@ class ContentService:
             styler = getattr(instance, "_apply_body_paragraph_style", None)
             if callable(styler):
                 return styler(paragraph, size_pt=size_pt, bold=bold, color=color)
-            return None
+            paragraph.font.size = Pt(size_pt)
+            paragraph.font.bold = bold
+            paragraph.font.name = "Microsoft YaHei"
+            if color is not None:
+                paragraph.font.color.rgb = RGBColor(*color)
 
         def _add_open_demo_links(instance, slide):
             box = slide.shapes.add_shape(
@@ -566,13 +590,19 @@ class ContentService:
                 resources = list(active_package.get("open_demo_references") or [])[:4]
             if not resources:
                 resources = [
-                    {"name": label, "url": url, "summary": "用于课堂演示与课后拓展。", "teaching_hint": "建议结合本节主题进行定向检索。"}
-                    for label, url in self.OPEN_DEMO_LINKS
+                    {
+                        "name": site.get("name", ""),
+                        "url": site.get("url", ""),
+                        "summary": site.get("default_summary", "用于课堂演示与课后拓展。"),
+                        "brief_intro": site.get("brief_intro", ""),
+                        "teaching_hint": "；".join(site.get("suggestions", [])) or "建议结合本节主题进行定向检索。",
+                    }
+                    for site in self.OPEN_DEMO_SITES
                 ]
 
             card_w = 5.52
-            card_h = 2.28
-            positions = [(0.95, 1.55), (6.83, 1.55), (0.95, 4.05), (6.83, 4.05)]
+            card_h = 2.50
+            positions = [(0.95, 1.45), (6.83, 1.45), (0.95, 4.10), (6.83, 4.10)]
             for idx, item in enumerate(resources[:4]):
                 left, top = positions[idx]
                 card = slide.shapes.add_shape(
@@ -591,22 +621,28 @@ class ContentService:
 
                 name_p = frame.paragraphs[0]
                 name_p.text = str(item.get("name") or f"资源 {idx + 1}")
-                _style_paragraph(instance, name_p, size_pt=15, bold=True, color=instance.theme["accent"])
+                _style_paragraph(instance, name_p, size_pt=14, bold=True, color=instance.theme["accent"])
+
+                intro_text = str(item.get("brief_intro") or "").strip()
+                if intro_text:
+                    intro_p = frame.add_paragraph()
+                    intro_p.text = intro_text[:120]
+                    _style_paragraph(instance, intro_p, size_pt=10, color=instance.theme["dark_text"])
 
                 summary_p = frame.add_paragraph()
-                summary_p.text = str(item.get("summary") or "该网站可用于数学可视化演示。")[:90]
-                _style_paragraph(instance, summary_p, size_pt=12, color=instance.theme["dark_text"])
+                summary_p.text = str(item.get("summary") or "该网站可用于数学可视化演示。")[:110]
+                _style_paragraph(instance, summary_p, size_pt=11, color=instance.theme["dark_text"])
 
                 hint_p = frame.add_paragraph()
-                hint_p.text = f"课堂用法：{str(item.get('teaching_hint') or '作为拓展演示与讨论素材')}"[:100]
-                _style_paragraph(instance, hint_p, size_pt=11, color=instance.theme["dark_text"])
+                hint_p.text = f"课堂用法：{str(item.get('teaching_hint') or '作为拓展演示与讨论素材')}"[:120]
+                _style_paragraph(instance, hint_p, size_pt=10, color=instance.theme["dark_text"])
 
                 link_p = frame.add_paragraph()
                 link_p.text = ""
                 link_run = link_p.add_run()
                 link_run.text = "🔗 打开链接"
                 link_run.hyperlink.address = str(item.get("url") or "")
-                _style_paragraph(instance, link_p, size_pt=12, bold=True, color=instance.theme["accent"])
+                _style_paragraph(instance, link_p, size_pt=11, bold=True, color=instance.theme["accent"])
 
         def _wrapped_add_interactive(instance, prs, slide_data: dict, package: dict | None = None, slide_index: int | None = None):
             resolved_package = package if isinstance(package, dict) else getattr(instance, "_active_export_package", {})
@@ -667,6 +703,7 @@ class ContentService:
         elif not session.get("selected_template"):
             session["selected_template"] = template_meta["recommended"]
 
+        self._update_progress(session, 10, "正在检索知识库...")
         search_plan = self._compose_search_plan(session, revision)
         retrievals = self.rag_service.search(
             session_id=session_id,
@@ -675,20 +712,37 @@ class ContentService:
             include_global=True,
             query_hints=search_plan["query_hints"],
         )
+        self._update_progress(session, 20, "正在生成课件内容...")
         instruction_bundle = self._build_instruction_bundle(session, retrievals, revision, session["selected_template"])
         package = self._build_package(session=session, retrievals=retrievals, instruction_bundle=instruction_bundle)
         package = self._ensure_interactive_slide(package=package, instruction_bundle=instruction_bundle)
-        open_demo_references = []
-        if self._has_open_resource_intent(instruction_bundle):
+        has_open_resource = self._has_open_resource_intent(instruction_bundle)
+        has_interactive = include_interactive_media and self._has_interactive_intent(instruction_bundle)
+
+        if has_open_resource and has_interactive:
+            self._update_progress(session, 45, "正在获取资源与生成演示...")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                demo_future = executor.submit(self._build_open_demo_references, instruction_bundle)
+                asset_future = executor.submit(self._build_interactive_assets, session_id, package, instruction_bundle)
+                open_demo_references = demo_future.result()
+                interactive_assets = asset_future.result()
+        elif has_open_resource:
+            self._update_progress(session, 45, "正在获取开源演示资源...")
             open_demo_references = self._build_open_demo_references(instruction_bundle)
+            interactive_assets = []
+        elif has_interactive:
+            self._update_progress(session, 45, "正在生成知识演示视频...")
+            open_demo_references = []
+            interactive_assets = self._build_interactive_assets(session_id, package, instruction_bundle)
+        else:
+            open_demo_references = []
+            interactive_assets = []
+
+        if open_demo_references:
             package["open_demo_references"] = open_demo_references
             package = self._ensure_open_demo_resource_slide(package=package, references=open_demo_references)
-        if include_interactive_media:
-            package["interactive_assets"] = self._build_interactive_assets(
-                session_id=session_id,
-                package=package,
-                instruction_bundle=instruction_bundle,
-            )
+        if interactive_assets:
+            package["interactive_assets"] = interactive_assets
         package["instruction_bundle"] = instruction_bundle
         return package, retrievals, instruction_bundle
 
@@ -797,7 +851,7 @@ class ContentService:
             "resources": references[:4],
             "bullets": [
                 {
-                    "text": f"{item.get('name', '资源')}：{item.get('summary', '')}",
+                    "text": f"{item.get('name', '资源')}：{item.get('brief_intro') or item.get('summary', '')}",
                     "section_hint": "main",
                 }
                 for item in references[:4]
@@ -834,19 +888,39 @@ class ContentService:
             return self._site_reference_cache[cache_key]
 
         refs = []
-        for site in self.OPEN_DEMO_SITES:
-            target_url = self._find_precise_site_page_url(site=site, topic=topic)
-            refs.append(
-                {
-                    "name": site["name"],
-                    "url": target_url,
-                    "summary": self._site_summary(site, topic, target_url),
-                    "teaching_hint": self._site_teaching_hint(site, topic),
-                }
-            )
+        site_results = {}
+        with ThreadPoolExecutor(max_workers=min(len(self.OPEN_DEMO_SITES), 4)) as executor:
+            future_to_idx = {
+                executor.submit(self._build_single_site_ref, site, topic): idx
+                for idx, site in enumerate(self.OPEN_DEMO_SITES)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    site_results[idx] = future.result()
+                except Exception:
+                    site_results[idx] = {
+                        "name": self.OPEN_DEMO_SITES[idx].get("name", ""),
+                        "url": self.OPEN_DEMO_SITES[idx].get("url", ""),
+                        "summary": self.OPEN_DEMO_SITES[idx].get("default_summary", "可用于课堂演示。"),
+                        "brief_intro": self.OPEN_DEMO_SITES[idx].get("brief_intro", ""),
+                        "teaching_hint": "建议按本节关键词检索并挑选一个演示用于课堂讲解。",
+                    }
+        for idx in sorted(site_results.keys()):
+            refs.append(site_results[idx])
 
         self._site_reference_cache[cache_key] = refs
         return refs
+
+    def _build_single_site_ref(self, site: dict, topic: str):
+        target_url = self._find_precise_site_page_url(site=site, topic=topic)
+        return {
+            "name": site["name"],
+            "url": target_url,
+            "summary": self._site_summary(site, topic, target_url),
+            "brief_intro": site.get("brief_intro", ""),
+            "teaching_hint": self._site_teaching_hint(site, topic),
+        }
 
     def _has_open_resource_intent(self, instruction_bundle: dict):
         teacher_intent = instruction_bundle.get("teacher_intent") or {}

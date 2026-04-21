@@ -27,6 +27,8 @@ DEFAULT_SESSION = {
         "generating_doc": False,
         "revising": False,
         "generation_locked": False,
+        "progress_percent": 0,
+        "progress_label": "",
     },
 }
 

@@ -355,29 +355,20 @@ input {
 }
 
 .ppt-loading-fill {
-  position: absolute;
-  top: 0;
-  left: -35%;
-  width: 35%;
+  position: relative;
+  width: 0%;
   height: 100%;
   background: linear-gradient(90deg, #2b6cf6, #56a3ff);
   border-radius: 999px;
-  animation: ppt-loading-slide 1.25s ease-in-out infinite;
+  transition: width 0.6s ease;
 }
 
 .ppt-loading-text {
   margin-top: 4px;
   font-size: 0.74rem;
   color: #2b6cf6;
-}
-
-@keyframes ppt-loading-slide {
-  0% {
-    left: -35%;
-  }
-  100% {
-    left: 100%;
-  }
+  display: flex;
+  justify-content: space-between;
 }
 
 textarea {
@@ -797,6 +788,16 @@ textarea {
   font-size: 0.8rem;
   color: var(--muted);
   line-height: 1.35;
+}
+
+.back-to-result-wrap {
+  margin-top: 12px;
+  display: flex;
+  justify-content: center;
+}
+
+.back-to-result-wrap.hidden {
+  display: none;
 }
 
 @media (max-width: 1200px) {

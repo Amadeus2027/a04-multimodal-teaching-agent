@@ -7,6 +7,9 @@ const state = {
   isGeneratingPpt: false,
   isGeneratingDoc: false,
   isRevising: false,
+  progressPercent: 0,
+  progressLabel: "",
+  progressTimer: null,
   templateSuggestions: [],
   templateCatalog: [],
   recommendedTemplate: "",
@@ -408,6 +411,53 @@ function closeTemplatePicker() {
   modal.setAttribute("aria-hidden", "true");
 }
 
+function updateBackToResultBtn() {
+  const wrap = $("#backToResultWrap");
+  if (!wrap) return;
+  if (state.generationLocked) {
+    wrap.classList.remove("hidden");
+  } else {
+    wrap.classList.add("hidden");
+  }
+}
+
+function renderProgressBar() {
+  const fill = document.querySelector(".ppt-loading-fill");
+  const text = document.querySelector(".ppt-loading-text");
+  if (!fill || !text) return;
+  const pct = Math.max(0, Math.min(100, state.progressPercent || 0));
+  fill.style.width = `${pct}%`;
+  text.innerHTML = `<span>${state.progressLabel || "准备中..."}</span><span>${pct}%</span>`;
+}
+
+function startProgressPolling() {
+  stopProgressPolling();
+  state.progressPercent = 0;
+  state.progressLabel = "准备中...";
+  renderProgressBar();
+  state.progressTimer = setInterval(async () => {
+    if (!state.sessionId) return;
+    try {
+      const data = await requestJSON(`/api/progress/${encodeURIComponent(state.sessionId)}`);
+      state.progressPercent = data.percent || 0;
+      state.progressLabel = data.label || "";
+      renderProgressBar();
+      if (!data.generating && state.progressPercent >= 100) {
+        stopProgressPolling();
+      }
+    } catch {
+      stopProgressPolling();
+    }
+  }, 1200);
+}
+
+function stopProgressPolling() {
+  if (state.progressTimer) {
+    clearInterval(state.progressTimer);
+    state.progressTimer = null;
+  }
+}
+
 function updateButtonStates() {
   const pptBtn = $("#generatePptBtn");
   const docBtn = $("#generateDocBtn");
@@ -460,6 +510,7 @@ function updateButtonStates() {
   docBtn.textContent = state.isGeneratingDoc ? "生成中" : "生成教案";
   reviseBtn.textContent = state.isRevising ? "优化中" : "根据意见重新优化";
   renderTemplateSelector();
+  updateBackToResultBtn();
 }
 
 function renderSessionHistory() {
@@ -518,6 +569,9 @@ async function createSession() {
   state.isGeneratingPpt = false;
   state.isGeneratingDoc = false;
   state.isRevising = false;
+  state.progressPercent = 0;
+  state.progressLabel = "";
+  stopProgressPolling();
   state.templateSuggestions = [];
   state.templateCatalog = [];
   state.recommendedTemplate = "";
@@ -648,6 +702,7 @@ async function generatePpt() {
   if (state.isGeneratingPpt || state.isGeneratingDoc || state.isRevising) return;
   state.isGeneratingPpt = true;
   updateButtonStates();
+  startProgressPolling();
   $("#sessionState").textContent = "正在生成 PPT...";
   try {
     const result = await requestJSON("/api/generate/ppt", {
@@ -662,6 +717,10 @@ async function generatePpt() {
     await refreshSessionHistory();
   } finally {
     state.isGeneratingPpt = false;
+    stopProgressPolling();
+    state.progressPercent = 100;
+    state.progressLabel = "生成完成";
+    renderProgressBar();
     updateButtonStates();
   }
 }
@@ -675,6 +734,7 @@ async function generateDoc() {
   if (state.isGeneratingDoc || state.isGeneratingPpt || state.isRevising) return;
   state.isGeneratingDoc = true;
   updateButtonStates();
+  startProgressPolling();
   $("#sessionState").textContent = "正在生成教案...";
   try {
     const result = await requestJSON("/api/generate/docx", {
@@ -689,6 +749,10 @@ async function generateDoc() {
     await refreshSessionHistory();
   } finally {
     state.isGeneratingDoc = false;
+    stopProgressPolling();
+    state.progressPercent = 100;
+    state.progressLabel = "生成完成";
+    renderProgressBar();
     updateButtonStates();
   }
 }
@@ -703,6 +767,7 @@ async function revisePackage() {
   if (state.isRevising) return;
   state.isRevising = true;
   updateButtonStates();
+  startProgressPolling();
   $("#sessionState").textContent = "正在根据修改意见优化...";
   try {
     const result = await requestJSON("/api/revise", {
@@ -712,11 +777,16 @@ async function revisePackage() {
     });
     renderPackage(result);
     $("#revisionInput").value = "";
+    state.generationLocked = true;
     $("#sessionState").textContent = "已根据意见重新优化";
     switchView("result");
     await refreshSessionHistory();
   } finally {
     state.isRevising = false;
+    stopProgressPolling();
+    state.progressPercent = 100;
+    state.progressLabel = "优化完成";
+    renderProgressBar();
     updateButtonStates();
   }
 }
@@ -742,6 +812,7 @@ function bindEvents() {
   $("#sidebarNewChatBtn")?.addEventListener("click", () => createSession().catch(handleError));
   $("#newSessionBtn")?.addEventListener("click", () => createSession().catch(handleError));
   $("#backToChatBtn")?.addEventListener("click", () => switchView("chat"));
+  $("#backToResultBtn")?.addEventListener("click", () => switchView("result"));
   $("#sendBtn")?.addEventListener("click", () => sendMessage().catch(handleError));
   $("#chatInput")?.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
