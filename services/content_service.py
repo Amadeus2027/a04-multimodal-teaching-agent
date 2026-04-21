@@ -5,13 +5,14 @@ import re
 import ast
 import copy
 import types
+import base64
 from pathlib import Path
 import hashlib
 import zipfile
 import subprocess
 import os
 from html import unescape
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus, urljoin, urlparse, parse_qs, unquote
 from urllib.request import Request, urlopen
 
 from pptx.dml.color import RGBColor
@@ -38,28 +39,60 @@ class ContentService:
         {
             "name": "GeoGebra",
             "url": "https://www.geogebra.org/",
+            "domain": "geogebra.org",
             "search": "https://www.geogebra.org/search/{query}",
+            "search_templates": [
+                "https://www.geogebra.org/search/{query}",
+                "https://www.geogebra.org/materials?query={query}",
+                "https://duckduckgo.com/html/?q=site%3Ageogebra.org+{query_plus}",
+                "https://www.bing.com/search?q=site%3Ageogebra.org+{query_plus}",
+            ],
+            "detail_hints": ["/m/", "/material/", "/materials/", "activity"],
+            "avoid_hints": ["/search", "login", "signup", "privacy", "terms"],
             "default_summary": "覆盖函数图像、几何构造与课堂活动，适合做概念可视化与探究任务。",
             "suggestions": ["函数图像动态演示", "参数变化观察", "课堂互动活动"],
         },
         {
             "name": "Desmos Calculator",
             "url": "https://www.desmos.com/calculator",
-            "search": "https://www.desmos.com/calculator",
+            "domain": "desmos.com",
+            "search": "https://teacher.desmos.com/search?q={query}",
+            "search_templates": [
+                "https://teacher.desmos.com/search?q={query}",
+                "https://duckduckgo.com/html/?q=site%3Adesmos.com+{query_plus}",
+                "https://www.bing.com/search?q=site%3Adesmos.com+{query_plus}",
+            ],
+            "detail_hints": ["/calculator/", "/3d/", "/activitybuilder/", "/activities/"],
+            "avoid_hints": ["/search", "login", "signup", "privacy", "terms"],
             "default_summary": "图形计算器响应快，适合展示函数、极限邻域变化与参数联动。",
             "suggestions": ["函数与导数图像", "极限邻域放大", "参数滑块演示"],
         },
         {
             "name": "Math3D",
             "url": "https://www.math3d.org/",
+            "domain": "math3d.org",
             "search": "https://www.math3d.org/",
+            "search_templates": [
+                "https://duckduckgo.com/html/?q=site%3Amath3d.org+{query_plus}",
+                "https://www.bing.com/search?q=site%3Amath3d.org+{query_plus}",
+            ],
+            "detail_hints": ["/examples", "/example", "/gallery", "/lesson", "/surface"],
+            "avoid_hints": ["/search", "login", "signup", "privacy", "terms"],
             "default_summary": "面向三维函数与曲面演示，可用于空间几何与多元函数直观讲解。",
             "suggestions": ["三维曲面观察", "截面变化", "空间参数影响"],
         },
         {
             "name": "Wolfram Demonstrations",
             "url": "https://demonstrations.wolfram.com/",
-            "search": "https://demonstrations.wolfram.com/",
+            "domain": "demonstrations.wolfram.com",
+            "search": "https://demonstrations.wolfram.com/search.html?query={query}",
+            "search_templates": [
+                "https://demonstrations.wolfram.com/search.html?query={query}",
+                "https://duckduckgo.com/html/?q=site%3Ademonstrations.wolfram.com+{query_plus}",
+                "https://www.bing.com/search?q=site%3Ademonstrations.wolfram.com+{query_plus}",
+            ],
+            "detail_hints": ["/demonstrations/", "/topics/", "/detail"],
+            "avoid_hints": ["/search", "login", "signup", "privacy", "terms"],
             "default_summary": "汇集大量数学与科学交互演示，适合做拓展案例与课后探索。",
             "suggestions": ["可视化案例拓展", "跨学科演示", "探究式作业素材"],
         },
@@ -108,6 +141,7 @@ class ContentService:
         self.interactive_clip_duration = float(os.getenv("INTERACTIVE_CLIP_DURATION_SECONDS", "18"))
         self.interactive_max_videos = max(0, int(os.getenv("INTERACTIVE_MAX_VIDEOS", "1")))
         self._site_reference_cache = {}
+        self._topic_term_cache = {}
         self.workspace_root = output_dir.parent
         self.template_thumb_dir = self.workspace_root / "static" / "template_thumbs"
         self.template_thumb_dir.mkdir(parents=True, exist_ok=True)
@@ -445,18 +479,6 @@ class ContentService:
     def _ensure_interactive_movie_embedding_hook(self):
         service = self.export_service
 
-        if not hasattr(service, "_apply_body_paragraph_style") and hasattr(service, "_format_body_paragraph"):
-            def _compat_apply(instance, paragraph, *, size_pt: float, bold: bool = False, color=None):
-                return instance._format_body_paragraph(paragraph, size_pt=size_pt, bold=bold, color=color)
-
-            service._apply_body_paragraph_style = types.MethodType(_compat_apply, service)
-
-        if not hasattr(service, "_format_body_paragraph") and hasattr(service, "_apply_body_paragraph_style"):
-            def _compat_format(instance, paragraph, *, size_pt: float, bold: bool = False, color=None):
-                return instance._apply_body_paragraph_style(paragraph, size_pt=size_pt, bold=bold, color=color)
-
-            service._format_body_paragraph = types.MethodType(_compat_format, service)
-
         if getattr(service, "_interactive_movie_hook_installed", False):
             return
 
@@ -503,9 +525,6 @@ class ContentService:
             styler = getattr(instance, "_apply_body_paragraph_style", None)
             if callable(styler):
                 return styler(paragraph, size_pt=size_pt, bold=bold, color=color)
-            legacy_styler = getattr(instance, "_format_body_paragraph", None)
-            if callable(legacy_styler):
-                return legacy_styler(paragraph, size_pt=size_pt, bold=bold, color=color)
             return None
 
         def _add_open_demo_links(instance, slide):
@@ -804,18 +823,24 @@ class ContentService:
         knowledge = str(teacher_intent.get("knowledge_points") or "").strip()
         revision = str(teacher_intent.get("revision") or "").strip()
         creative = " ".join(teacher_intent.get("creative_requests") or [])
-        topic = " ".join([item for item in [course_theme, knowledge, revision, creative] if item]).strip() or "高等数学"
+        focus_terms = self._extract_focus_terms(" ".join([revision, creative]))
+        topic_parts = [item for item in [course_theme, knowledge] if item]
+        if focus_terms:
+            topic_parts.append(" ".join(focus_terms[:2]))
+        topic = " ".join(topic_parts).strip() or "高等数学"
+        topic = topic[:72]
         cache_key = self._safe_token(topic)
         if cache_key in self._site_reference_cache:
             return self._site_reference_cache[cache_key]
 
         refs = []
         for site in self.OPEN_DEMO_SITES:
+            target_url = self._find_precise_site_page_url(site=site, topic=topic)
             refs.append(
                 {
                     "name": site["name"],
-                    "url": self._build_site_url(site, topic),
-                    "summary": self._site_summary(site, topic),
+                    "url": target_url,
+                    "summary": self._site_summary(site, topic, target_url),
                     "teaching_hint": self._site_teaching_hint(site, topic),
                 }
             )
@@ -844,7 +869,10 @@ class ContentService:
         template = str(site.get("search") or site.get("url") or "").strip()
         if not template:
             return ""
-        q = re.sub(r"\s+", " ", topic).strip()
+        q = self._build_site_query_text(topic=topic, site=site)
+        q = re.sub(r"\s+", " ", q).strip()
+        if "{query_plus}" in template:
+            return template.format(query=quote(q), query_plus=quote_plus(q))
         if "{query}" in template:
             return template.format(query=quote(q))
         if "?" in template:
@@ -853,9 +881,455 @@ class ContentService:
             return f"{template.rstrip('/')}/search/{quote(q)}"
         return template
 
-    def _site_summary(self, site: dict, topic: str):
+    def _build_site_query_text(self, topic: str, site: dict):
+        candidates = self._topic_query_candidates(topic=topic, site=site)
+        if candidates:
+            return candidates[0]
+        return re.sub(r"\s+", " ", str(topic or "")).strip() or "calculus function"
+
+    def _find_precise_site_page_url(self, site: dict, topic: str):
+        domain = str(site.get("domain") or urlparse(str(site.get("url") or "")).netloc).lower().strip()
+        fallback_url = self._build_site_url(site, topic)
+        if not domain:
+            return fallback_url
+
+        curated_url = self._pick_curated_site_url(site=site, topic=topic)
+        if curated_url:
+            return curated_url
+
+        queries = self._topic_query_candidates(topic=topic, site=site)
+        templates = list(site.get("search_templates") or [])
+        if not templates:
+            templates = [str(site.get("search") or site.get("url") or "").strip()]
+
+        candidates = {}
+        seen = set()
+        attempts = 0
+        max_attempts = 5
+        for template in templates[:3]:
+            for q in queries[:3]:
+                if attempts >= max_attempts:
+                    break
+                search_url = str(template or "").format(query=quote(q), query_plus=quote_plus(q))
+                attempts += 1
+                html = self._fetch_web_html(search_url)
+                if not html:
+                    continue
+                for link in self._extract_links_from_html(search_url, html):
+                    norm = link.strip()
+                    if not norm or norm in seen:
+                        continue
+                    seen.add(norm)
+                    if self._is_asset_url(norm):
+                        continue
+                    parsed = urlparse(norm)
+                    netloc = parsed.netloc.lower()
+                    if domain not in netloc:
+                        continue
+                    score = self._score_page_match(norm, topic, site_name=str(site.get("name") or ""), site=site)
+                    if score <= 0:
+                        continue
+                    candidates[norm] = max(float(score), float(candidates.get(norm, 0)))
+
+                # 对列表页进行二跳解析，尽量拿到站内详情页。
+                seeds = sorted(candidates.items(), key=lambda item: item[1], reverse=True)[:3]
+                for seed_url, seed_score in seeds:
+                    if not self._is_listing_url(seed_url, site=site):
+                        continue
+                    deep_html = self._fetch_web_html(seed_url)
+                    if not deep_html:
+                        continue
+                    for deep_link in self._extract_links_from_html(seed_url, deep_html):
+                        deep_url = deep_link.strip()
+                        if not deep_url or deep_url in seen:
+                            continue
+                        seen.add(deep_url)
+                        if self._is_asset_url(deep_url):
+                            continue
+                        deep_parsed = urlparse(deep_url)
+                        if domain not in deep_parsed.netloc.lower():
+                            continue
+                        deep_score = self._score_page_match(deep_url, topic, site_name=str(site.get("name") or ""), site=site)
+                        if self._is_detail_url(deep_url, site=site):
+                            deep_score += 4
+                        if deep_score <= 0:
+                            continue
+                        candidates[deep_url] = max(float(deep_score), float(candidates.get(deep_url, 0)), float(seed_score))
+            if attempts >= max_attempts:
+                break
+
+        if not candidates:
+            return fallback_url
+
+        ranked = sorted(candidates.items(), key=lambda item: item[1], reverse=True)
+        enriched = []
+        for url, score in ranked[:6]:
+            title_text, _ = self._fetch_web_title_desc(url)
+            title_bonus = self._score_title_match(title_text=title_text, topic=topic)
+            detail_bonus = 2 if self._is_detail_url(url, site=site) else 0
+            enriched.append((score + title_bonus + detail_bonus, url, title_text))
+        if not enriched:
+            return fallback_url
+
+        enriched.sort(key=lambda item: item[0], reverse=True)
+        if len(enriched) >= 2 and abs(enriched[0][0] - enriched[1][0]) <= 2.5:
+            llm_pick = self._llm_pick_best_site_url(site=site, topic=topic, ranked_candidates=enriched[:4])
+            if llm_pick:
+                return llm_pick
+
+        best = enriched[0][1]
+        return best or fallback_url
+
+    def _pick_curated_site_url(self, site: dict, topic: str):
+        site_name = str(site.get("name") or "").lower()
+        topic_text = str(topic or "").lower()
+        focus_terms = set(self._extract_focus_terms(topic))
+
+        def _has(*tokens):
+            return any(token in topic_text or token in focus_terms for token in tokens)
+
+        candidates = []
+        if "geogebra" in site_name:
+            if _has("3d", "geometry"):
+                candidates = ["https://www.geogebra.org/3d", "https://www.geogebra.org/graphing"]
+            else:
+                candidates = ["https://www.geogebra.org/graphing", "https://www.geogebra.org/classic"]
+        elif "desmos" in site_name:
+            if _has("3d", "geometry", "surface"):
+                candidates = ["https://www.desmos.com/3d", "https://www.desmos.com/calculator"]
+            elif _has("ratio", "arithmetic"):
+                candidates = ["https://www.desmos.com/fourfunction", "https://www.desmos.com/calculator"]
+            else:
+                candidates = ["https://www.desmos.com/calculator", "https://www.desmos.com/3d"]
+        elif "math3d" in site_name:
+            if _has("3d", "geometry", "surface"):
+                candidates = ["https://www.math3d.org/gallery", "https://www.math3d.org/examples"]
+            else:
+                candidates = ["https://www.math3d.org/examples", "https://www.math3d.org/gallery"]
+        elif "wolfram" in site_name:
+            if _has("limit", "epsilon", "delta"):
+                candidates = [
+                    "https://demonstrations.wolfram.com/EpsilonDeltaDefinitionOfALimit/",
+                    "https://demonstrations.wolfram.com/LimitOfAFunction/",
+                    "https://demonstrations.wolfram.com/OneSidedLimits/",
+                ]
+            elif _has("derivative"):
+                candidates = [
+                    "https://demonstrations.wolfram.com/DerivativeAsTheLimitOfTheDifferenceQuotient/",
+                    "https://demonstrations.wolfram.com/topics/Calculus.html",
+                ]
+            elif _has("integral"):
+                candidates = [
+                    "https://demonstrations.wolfram.com/CalculusAndAnalysis.html",
+                    "https://demonstrations.wolfram.com/topics/Calculus.html",
+                ]
+            else:
+                candidates = [
+                    "https://demonstrations.wolfram.com/topics/Calculus.html",
+                    "https://demonstrations.wolfram.com/CalculusAndAnalysis.html",
+                ]
+
+        for url in candidates:
+            if self._url_is_reachable(url):
+                return url
+        return ""
+
+    def _url_is_reachable(self, url: str):
+        html = self._fetch_web_html(url)
+        if len(html) < 200:
+            return False
+        lowered = html.lower()
+        if "<html" not in lowered and "<!doctype" not in lowered:
+            return False
+        return True
+
+    def _topic_query_candidates(self, topic: str, site: dict):
+        base = re.sub(r"\s+", " ", str(topic or "")).strip() or "高等数学"
+        site_hint = str(site.get("name") or "").lower()
+        suggestions = list(site.get("suggestions") or [])
+        mapped_terms = list(self._extract_focus_terms(base))
+        llm_terms = self._llm_expand_topic_terms(base)
+        short = " ".join(llm_terms[:3]).strip() or " ".join(mapped_terms[:3]).strip() or "calculus function"
+
+        candidates = [
+            f"{short} {site_hint}".strip(),
+            short,
+            "calculus function graph",
+        ]
+        for term in llm_terms[:3]:
+            candidates.append(f"{term} {site_hint}".strip())
+            candidates.append(term)
+        if suggestions:
+            candidates.append(" ".join(self._extract_focus_terms(str(suggestions[0]))[:3]) or short)
+        deduped = []
+        for item in candidates:
+            val = re.sub(r"\s+", " ", item).strip()
+            val = val[:48]
+            if val and val not in deduped:
+                deduped.append(val)
+        return deduped
+
+    def _llm_expand_topic_terms(self, topic: str):
+        raw_topic = re.sub(r"\s+", " ", str(topic or "")).strip() or "高等数学"
+        cache_key = self._safe_token(f"topic_terms::{raw_topic}")
+        if cache_key in self._topic_term_cache:
+            return list(self._topic_term_cache[cache_key])
+
+        fallback_terms = self._extract_focus_terms(raw_topic)
+        if not fallback_terms:
+            fallback_terms = ["calculus", "function", "graph", "limit"]
+
+        result = self.llm_client.chat_json(
+            system_prompt=(
+                "你是数学教学资源检索词助手。"
+                "把中文教学主题转换为 4~8 个英文检索短词，"
+                "仅输出 JSON：{\"keywords\": [\"...\"]}。"
+                "关键词需适合 GeoGebra/Desmos/Math3D/Wolfram 检索。"
+            ),
+            user_prompt=json.dumps(
+                {
+                    "topic": raw_topic,
+                    "fallback_terms": fallback_terms,
+                    "constraints": ["english only", "2-4 words each", "math interactive demo oriented"],
+                },
+                ensure_ascii=False,
+            ),
+            fallback={"keywords": fallback_terms},
+        )
+
+        keywords = []
+        for item in (result.get("keywords") or []):
+            token = re.sub(r"[^a-z0-9\s\-]", " ", str(item).lower())
+            token = re.sub(r"\s+", " ", token).strip()
+            if not token:
+                continue
+            if token not in keywords:
+                keywords.append(token)
+        if not keywords:
+            keywords = fallback_terms
+
+        self._topic_term_cache[cache_key] = keywords[:8]
+        return list(self._topic_term_cache[cache_key])
+
+    def _extract_focus_terms(self, text: str):
+        source = str(text or "")
+        pairs = [
+            ("极限", "limit"),
+            ("导数", "derivative"),
+            ("函数", "function"),
+            ("图像", "graph"),
+            ("参数", "parameter"),
+            ("积分", "integral"),
+            ("三维", "3d"),
+            ("几何", "geometry"),
+        ]
+        terms = []
+        lower = source.lower()
+        for zh, en in pairs:
+            if zh in source or en in lower:
+                terms.append(en)
+        return terms
+
+    def _is_asset_url(self, url: str):
+        lowered = str(url or "").lower()
+        if any(token in lowered for token in ["/static/", "/assets/", "/img/", "/images/"]):
+            return True
+        if any(lowered.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css", ".js", ".woff", ".woff2", ".ttf"]):
+            return True
+        return False
+
+    def _is_listing_url(self, url: str, site: dict):
+        lowered = str(url or "").lower()
+        listing_tokens = ["search", "query=", "/topics", "/browse", "/tag", "/tags", "/results", "/materials?", "format=rss"]
+        if any(token in lowered for token in listing_tokens):
+            return True
+        for marker in (site.get("avoid_hints") or []):
+            if str(marker).lower() in lowered:
+                return True
+        return False
+
+    def _is_detail_url(self, url: str, site: dict):
+        parsed = urlparse(str(url or ""))
+        lowered = str(url or "").lower()
+        if self._is_listing_url(lowered, site=site):
+            return False
+        for marker in (site.get("detail_hints") or []):
+            if str(marker).lower() in lowered:
+                return True
+        path_segments = [seg for seg in parsed.path.split("/") if seg]
+        if len(path_segments) >= 2:
+            tail = path_segments[-1].lower()
+            if any(ch.isdigit() for ch in tail) and len(tail) >= 4:
+                return True
+            if "-" in tail and len(tail) >= 8:
+                return True
+        return False
+
+    def _fetch_web_html(self, url: str):
+        target = str(url or "").strip()
+        if not target.startswith("http"):
+            return ""
+        try:
+            request = Request(target, headers={"User-Agent": "Mozilla/5.0 A04-Teaching-Agent"})
+            with urlopen(request, timeout=2.2) as response:
+                payload = response.read(300000)
+            return payload.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _extract_links_from_html(self, base_url: str, html: str):
+        links = []
+        for match in re.finditer(r"href=[\"']([^\"']+)[\"']", str(html or ""), flags=re.IGNORECASE):
+            href = str(match.group(1) or "").strip()
+            if not href or href.startswith("#"):
+                continue
+            if href.startswith("javascript:") or href.startswith("mailto:"):
+                continue
+            absolute = urljoin(base_url, href)
+            absolute = self._unwrap_search_redirect(absolute)
+            parsed = urlparse(absolute)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            normalized = absolute.split("#", 1)[0]
+            links.append(normalized)
+        return links
+
+    def _unwrap_search_redirect(self, url: str):
+        target = str(url or "").strip()
+        parsed = urlparse(target)
+        query = parse_qs(parsed.query)
+
+        for key in ["uddg", "url", "target", "dest", "destination", "r"]:
+            val = (query.get(key) or [""])[0]
+            normalized = unquote(str(val or "").strip())
+            if normalized.startswith("http"):
+                return normalized
+
+        if "bing.com" in parsed.netloc.lower():
+            raw_u = (query.get("u") or [""])[0]
+            decoded = self._decode_bing_redirect(raw_u)
+            if decoded:
+                return decoded
+        return target
+
+    def _decode_bing_redirect(self, payload: str):
+        raw = unquote(str(payload or "").strip())
+        if not raw:
+            return ""
+        if raw.startswith("http"):
+            return raw
+
+        candidates = [raw]
+        if raw.startswith("a1") and len(raw) > 2:
+            candidates.append(raw[2:])
+
+        for item in candidates:
+            for padding in ["", "=", "==", "==="]:
+                try:
+                    decoded = base64.urlsafe_b64decode((item + padding).encode("utf-8")).decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    continue
+                if decoded.startswith("http"):
+                    return decoded
+        return ""
+
+    def _score_page_match(self, url: str, topic: str, site_name: str, site: dict | None = None):
+        score = 1.0
+        url_lower = str(url).lower()
+        if self._is_asset_url(url_lower):
+            return -100
+
+        if site and self._is_listing_url(url_lower, site=site):
+            score -= 4
+        if site and self._is_detail_url(url_lower, site=site):
+            score += 5
+
+        if url_lower.endswith("/") or url_lower.rstrip("/").count("/") <= 2:
+            score -= 1.5
+        if any(token in url_lower for token in ["uploads.", "cdn."]):
+            score -= 3
+        if any(token in url_lower for token in ["search", "login", "signup", "privacy", "tos"]):
+            score -= 2
+
+        if any(token in url_lower for token in ["/m/", "material", "activity", "lesson", "demonstration", "graph", "calculator", "surface", "3d"]):
+            score += 4
+
+        if "?" in url_lower:
+            score += 1
+
+        topic_tokens = [token for token in re.split(r"[，,、；;\s]+", str(topic or "").lower()) if len(token) >= 2]
+        for token in topic_tokens[:8]:
+            if token in url_lower:
+                score += 4
+
+        math_tokens = ["limit", "derivative", "function", "graph", "3d", "integral", "epsilon", "delta", "极限", "导数", "函数", "图像", "参数", "积分"]
+        for token in math_tokens:
+            if token in url_lower:
+                score += 2
+
+        if site_name and site_name.lower().replace(" ", "") in url_lower.replace("-", ""):
+            score += 0.8
+
+        return score
+
+    def _score_title_match(self, title_text: str, topic: str):
+        title = str(title_text or "").lower()
+        if not title:
+            return 0.0
+        score = 0.0
+        topic_terms = list(self._extract_focus_terms(topic)) + self._llm_expand_topic_terms(topic)[:5]
+        seen = set()
+        for term in topic_terms:
+            for token in str(term).split():
+                token = token.strip().lower()
+                if len(token) < 3 or token in seen:
+                    continue
+                seen.add(token)
+                if token in title:
+                    score += 1.2
+        return score
+
+    def _llm_pick_best_site_url(self, site: dict, topic: str, ranked_candidates: list[tuple[float, str, str]]):
+        if not self.llm_client.configured or not ranked_candidates:
+            return ""
+
+        candidate_payload = []
+        for score, url, title in ranked_candidates[:4]:
+            candidate_payload.append(
+                {
+                    "url": url,
+                    "title": title,
+                    "score": round(float(score), 3),
+                }
+            )
+
+        fallback_url = candidate_payload[0]["url"]
+        result = self.llm_client.chat_json(
+            system_prompt=(
+                "你是教学资源链接选择器。"
+                "从候选链接中选择一个最适合课堂演示的详情页（不是搜索首页），"
+                "返回 JSON：{\"best_url\": \"...\"}。"
+            ),
+            user_prompt=json.dumps(
+                {
+                    "site": site.get("name"),
+                    "topic": topic,
+                    "candidates": candidate_payload,
+                    "rule": "prefer detail page over search/listing page",
+                },
+                ensure_ascii=False,
+            ),
+            fallback={"best_url": fallback_url},
+        )
+        selected = str(result.get("best_url") or "").strip()
+        allowed = {item["url"] for item in candidate_payload}
+        if selected in allowed:
+            return selected
+        return ""
+
+    def _site_summary(self, site: dict, topic: str, target_url: str):
         default_text = str(site.get("default_summary") or "").strip() or "可用于课堂演示。"
-        title_text, desc_text = self._fetch_web_title_desc(str(site.get("url") or ""))
+        title_text, desc_text = self._fetch_web_title_desc(str(target_url or site.get("url") or ""))
         merged = "；".join([part for part in [title_text, desc_text] if part])
         if merged:
             merged = re.sub(r"\s+", " ", merged)

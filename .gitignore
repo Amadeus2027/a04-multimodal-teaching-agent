@@ -8,3 +8,11 @@ vector_store/*
 !uploads/.gitkeep
 !outputs/.gitkeep
 !vector_store/.gitkeep
+
+# runtime-generated preview assets
+static/generated_ppt_previews/*
+!static/generated_ppt_previews/.gitkeep
+
+# runtime-generated template thumbnails
+static/template_thumbs/*
+!static/template_thumbs/.gitkeep
